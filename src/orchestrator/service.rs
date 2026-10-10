@@ -595,13 +595,23 @@ where
         &self,
         request: &[u8],
         epoch: u64,
+        until: std::time::Instant,
     ) -> anyhow::Result<crate::sandbox::ReservedGrant> {
-        self.native_requester
+        anyhow::ensure!(
+            std::time::Instant::now() < until,
+            "late original reserve dispatch"
+        );
+        let mut requester = self
+            .native_requester
             .as_ref()
             .context("native issuer unavailable")?
             .lock()
-            .map_err(|_| anyhow::anyhow!("native issuer owner poisoned"))?
-            .reserve(request, epoch)
+            .map_err(|_| anyhow::anyhow!("native issuer owner poisoned"))?;
+        anyhow::ensure!(
+            std::time::Instant::now() < until,
+            "late original reserve owner admission"
+        );
+        requester.reserve_until(request, epoch, until)
     }
     pub fn native_query_original(
         &self,

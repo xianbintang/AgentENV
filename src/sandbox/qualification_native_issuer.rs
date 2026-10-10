@@ -237,7 +237,8 @@ async fn run_reserved_promotion(expired: bool) -> Result<()> {
         );
         let request = serde_json::to_vec(&envelope.request)?;
         stage = "authenticated_reserved_grant";
-        let grant = orchestrator.native_reserve_original(&request, envelope.authority_epoch)?;
+        let grant =
+            orchestrator.native_reserve_original(&request, envelope.authority_epoch, until)?;
         request_pin.verify()?;
         ensure!(
             grant.profile_path() == profile_path,

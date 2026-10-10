@@ -10,6 +10,9 @@ enum DiagnosticStage {
     Deadline,
     StateVerify,
     FinalDeadline,
+    FreezeGrant,
+    GrantDeadlineAgain,
+    Returned,
 }
 #[cfg(test)]
 struct StageDiagnostic {
@@ -1340,6 +1343,19 @@ impl NativeIssuerRequester {
     /// Raw request is still checked by the actual Worker lease owner; it grants
     /// no local authority. Calling intent is synced before the single grant send.
     pub fn reserve(&mut self, raw: &[u8], epoch: u64) -> Result<ReservedGrant> {
+        self.reserve_until(raw, epoch, Instant::now() + Duration::from_secs(3))
+    }
+    /// Inherited ingress deadline never restarts at reciprocal reservation.
+    pub fn reserve_until(
+        &mut self,
+        raw: &[u8],
+        epoch: u64,
+        inherited_until: Instant,
+    ) -> Result<ReservedGrant> {
+        ensure!(
+            Instant::now() < inherited_until,
+            "issuer inherited reservation deadline"
+        );
         ensure!(
             !raw.is_empty() && raw.len() <= 8192,
             "issuer request bounded"
@@ -1358,7 +1374,10 @@ impl NativeIssuerRequester {
                 && (1..=3000).contains(&r.context.remaining_budget_ms),
             "issuer request binding refused"
         );
-        let until = Instant::now() + Duration::from_millis(r.context.remaining_budget_ms);
+        let until = inherited_until
+            .min(Instant::now() + Duration::from_millis(r.context.remaining_budget_ms));
+        #[cfg(test)]
+        let mut diagnostic = StageDiagnostic::new(until);
         let mut original = r.clone();
         original.kind = "grant".into();
         original.context.attempt_id.clear();
@@ -1366,6 +1385,10 @@ impl NativeIssuerRequester {
         original.context.traceparent.clear();
         let fingerprint = digest(&serde_json::to_vec(&(original, epoch))?);
         self.verify()?;
+        ensure!(
+            Instant::now() < until,
+            "issuer inherited reservation deadline"
+        );
         if let Some(i) = &self.pending {
             if i.request.context.operation_id == r.context.operation_id {
                 ensure!(
@@ -1403,6 +1426,10 @@ impl NativeIssuerRequester {
             authority_epoch: epoch,
         })?;
         ensure!(durable.len() <= 8192, "issuer intent bounded");
+        ensure!(
+            Instant::now() < until,
+            "issuer Calling admission completed late"
+        );
         self.bytes += 124 * 1024;
         self.blocked = true;
         self.pending = Some(Intent {
@@ -1473,8 +1500,6 @@ impl NativeIssuerRequester {
             );
             let i = state.pending.take().unwrap();
             state.records.insert(r.context.operation_id.clone(), i);
-            #[cfg(test)]
-            let mut diagnostic = StageDiagnostic::new(until);
             let (endpoint_pin, raw) = Held::load(&state.endpoint_path)?;
             let endpoint: Endpoint = serde_json::from_slice(&raw)?;
             ensure!(
@@ -1507,18 +1532,26 @@ impl NativeIssuerRequester {
             #[cfg(test)]
             diagnostic.stage(DiagnosticStage::FinalDeadline);
             ensure!(Instant::now() < until, "issuer reservation completed late");
-            #[cfg(test)]
-            {
-                diagnostic.ok = true;
-            }
             Ok(grant)
         })();
         if let Ok(grant) = &result {
             let i = state.records.get_mut(&r.context.operation_id).unwrap();
+            #[cfg(test)]
+            diagnostic.stage(DiagnosticStage::FreezeGrant);
             freeze_grant(&mut i.grant, grant.clone())?;
+            #[cfg(test)]
+            diagnostic.stage(DiagnosticStage::GrantDeadlineAgain);
             i.expires = Some(grant.deadline()?);
+            ensure!(Instant::now() < until, "issuer reservation returned late");
             i.unknown = false;
             state.blocked = false;
+        }
+        #[cfg(test)]
+        {
+            if result.is_ok() {
+                diagnostic.stage(DiagnosticStage::Returned);
+                diagnostic.ok = true;
+            }
         }
         result
     }
@@ -2065,6 +2098,74 @@ mod production_tests {
             expires_monotonic_ns: 1,
         }
     }
+    #[test]
+    fn inherited_reserve_expiry_refuses_before_real_journal_effects() {
+        // Real owned files, no installation/global requester or reciprocal socket.
+        // The invalid endpoint makes accidental continuation observably fail at a
+        // different boundary, rather than manufacturing a successful grant.
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config");
+        std::fs::write(&config_path, b"owned config").unwrap();
+        let config_file = File::open(&config_path).unwrap();
+        let config_pin = config_file.metadata().unwrap();
+        let root_file = File::open(directory.path()).unwrap();
+        let directory_file = File::open(directory.path()).unwrap();
+        let directory_pin = directory_file.metadata().unwrap();
+        let directory_owner =
+            nix::fcntl::Flock::lock(directory_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .map_err(|(_, error)| error)
+                .unwrap();
+        let mut requester = NativeIssuerRequester {
+            state: Some(Box::new(RequesterState {
+                config_pin: Held {
+                    file: config_file,
+                    path: config_path.clone(),
+                    pin: config_pin.clone(),
+                    digest: Sha256::digest(b"owned config").into(),
+                },
+                publication: std::sync::Arc::new(Publication {
+                    state: Some(PublicationState {
+                        root_pin: root_file.metadata().unwrap(),
+                        root: root_file,
+                        root_path: directory.path().to_owned(),
+                        file: None,
+                        pin: None,
+                    }),
+                }),
+                endpoint_path: directory.path().join("absent-endpoint"),
+                directory: directory_owner,
+                directory_path: directory.path().to_owned(),
+                directory_pin,
+                incarnation: request().server_incarnation,
+                records: Default::default(),
+                peer: None,
+                blocked: false,
+                bytes: 128 * 1024,
+                pending: None,
+            })),
+        };
+        let raw = serde_json::to_vec(&request()).unwrap();
+        let first = requester
+            .reserve_until(&raw, 1, Instant::now())
+            .err()
+            .unwrap();
+        assert_eq!(first.to_string(), "issuer inherited reservation deadline");
+        // The wire still advertises 3000ms; actual elapsed inherited authority
+        // must not be renewed from that serialized value on the next call.
+        let earlier = Instant::now() + Duration::from_millis(2);
+        while Instant::now() < earlier {
+            std::thread::yield_now();
+        }
+        let second = requester.reserve_until(&raw, 1, earlier).err().unwrap();
+        assert_eq!(second.to_string(), "issuer inherited reservation deadline");
+        assert!(requester.records.is_empty() && requester.pending.is_none());
+        assert!(!requester.blocked && requester.bytes == 128 * 1024);
+        assert!(requester.peer.is_none());
+        assert!(!directory.path().join("0.json").exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert!(same(&config_pin, &std::fs::metadata(config_path).unwrap()));
+    }
+
     #[test]
     fn held_executable_boundary_rejects_wrong_content_authority_on_real_fd() {
         use std::io::{Seek, SeekFrom};

@@ -10,6 +10,8 @@
 enum DiagnosticStage {
     Gate,
     Reserve,
+    ReserveReturned,
+    PreLaunchDeadline,
     Launch,
     Execution,
 }
@@ -702,7 +704,20 @@ impl Ingress {
                         ensure!(Instant::now() < until, "late original reserve dispatch");
                         #[cfg(test)]
                         diagnostic.stage(DiagnosticStage::Reserve);
-                        sdk.native_reserve_original(&original, epoch)?;
+                        let reserved = sdk.native_reserve_original(&original, epoch, until);
+                        #[cfg(test)]
+                        {
+                            diagnostic.stage(DiagnosticStage::ReserveReturned);
+                            diagnostic.ok = reserved.is_ok();
+                            eprintln!(
+                                "native_retained stage=ReserveReturned ok={} remaining_ms={}",
+                                reserved.is_ok(),
+                                until.saturating_duration_since(Instant::now()).as_millis()
+                            );
+                        }
+                        reserved?;
+                        #[cfg(test)]
+                        diagnostic.stage(DiagnosticStage::PreLaunchDeadline);
                         ensure!(Instant::now() < until, "late original launch dispatch");
                         #[cfg(test)]
                         diagnostic.stage(DiagnosticStage::Launch);
