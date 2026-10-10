@@ -60,7 +60,7 @@ use std::{
     io::{IoSliceMut, Read, Write},
     os::{
         fd::{AsFd, AsRawFd, OwnedFd},
-        unix::fs::{MetadataExt, OpenOptionsExt},
+        unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
@@ -338,9 +338,66 @@ pub(super) fn cgroup(pid: u32) -> Result<PathBuf> {
     );
     Ok(Path::new("/sys/fs/cgroup").join(relative))
 }
+// Reads the original FD from offset zero without changing its shared OFD offset.
+fn held_executable_digest(file: &File, pin: &Metadata, until: Instant) -> Result<[u8; 32]> {
+    ensure!(Instant::now() < until, "issuer executable deadline");
+    ensure!(
+        pin.is_file()
+            && pin.len() > 0
+            && pin.len() <= 256 * 1024 * 1024
+            && same(pin, &file.metadata()?),
+        "issuer executable version refused"
+    );
+    let mut hash = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        ensure!(Instant::now() < until, "issuer executable deadline");
+        let n = file.read_at(&mut buffer, total)?;
+        ensure!(
+            Instant::now() < until,
+            "issuer executable read completed late"
+        );
+        if n == 0 {
+            break;
+        }
+        total = total
+            .checked_add(n as u64)
+            .context("issuer executable length overflow")?;
+        ensure!(total <= pin.len(), "issuer executable grew");
+        hash.update(&buffer[..n]);
+    }
+    let digest = hash.finalize().into();
+    ensure!(
+        total == pin.len() && same(pin, &file.metadata()?),
+        "issuer executable changed"
+    );
+    ensure!(
+        Instant::now() < until,
+        "issuer executable hash completed late"
+    );
+    Ok(digest)
+}
+// Every security boundary compares full original-FD bytes with frozen authority.
+fn verify_held_executable(
+    file: &File,
+    pin: &Metadata,
+    expected: &[u8; 32],
+    until: Instant,
+) -> Result<()> {
+    ensure!(
+        held_executable_digest(file, pin, until)? == *expected,
+        "issuer executable content changed"
+    );
+    ensure!(
+        Instant::now() < until,
+        "issuer content verification completed late"
+    );
+    Ok(())
+}
 pub(super) fn exe(pid: u32, until: Instant) -> Result<(File, Metadata, String)> {
     let path = format!("/proc/{pid}/exe");
-    let mut file = File::open(&path)?;
+    let file = File::open(&path)?;
     let pin = file.metadata()?;
     ensure!(
         pin.is_file()
@@ -354,32 +411,19 @@ pub(super) fn exe(pid: u32, until: Instant) -> Result<(File, Metadata, String)> 
     );
     #[cfg(test)]
     let diagnostic_started = Instant::now();
-    let mut hash = Sha256::new();
-    let mut total = 0u64;
-    let mut buffer = [0u8; 65536];
-    loop {
-        ensure!(Instant::now() < until, "issuer executable deadline");
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        total += n as u64;
-        ensure!(total <= pin.len(), "issuer executable grew");
-        hash.update(&buffer[..n]);
-    }
+    let digest = held_executable_digest(&file, &pin, until)?;
     ensure!(
-        total == pin.len()
-            && same(&pin, &file.metadata()?)
-            && same(&pin, &std::fs::metadata(path)?),
+        same(&pin, &std::fs::metadata(path)?),
         "issuer executable changed"
     );
     #[cfg(test)]
     eprintln!(
-        "issuer sdk hash: bytes={total} elapsed_ms={} remaining_ms={}",
+        "issuer sdk hash: bytes={} elapsed_ms={} remaining_ms={}",
+        pin.len(),
         diagnostic_started.elapsed().as_millis(),
         until.saturating_duration_since(Instant::now()).as_millis()
     );
-    Ok((file, pin, format!("{:x}", hash.finalize())))
+    Ok((file, pin, hex::encode(digest)))
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -452,6 +496,7 @@ pub(super) struct Peer {
     pub(super) pidfd: OwnedFd,
     pub(super) executable: File,
     pub(super) executable_pin: Metadata,
+    executable_sha256: [u8; 32],
     pub(super) cgroup_owner: File,
     pub(super) cgroup_pin: Metadata,
     pub(super) socket_pin: Metadata,
@@ -533,10 +578,13 @@ pub(super) fn validate_peer(
     );
     alive(&pidfd)?;
     ensure!(Instant::now() < until, "issuer peer validation deadline");
+    let mut executable_sha256 = [0u8; 32];
+    hex::decode_to_slice(&digest, &mut executable_sha256)?;
     Ok(Peer {
         pidfd,
         executable,
         executable_pin,
+        executable_sha256,
         cgroup_owner: group,
         cgroup_pin: group_pin,
         socket_pin: socketpin,
@@ -569,8 +617,6 @@ impl Peer {
                 && cgroup(endpoint.peer_pid)? == endpoint.cgroup_path,
             "issuer peer incarnation changed"
         );
-        // The trusted full SHA was established once. A protected original inode
-        // must retain every numeric version field before and after each exchange.
         ensure!(
             same(&self.executable_pin, &self.executable.metadata()?)
                 && same(
@@ -587,6 +633,33 @@ impl Peer {
                     &std::fs::symlink_metadata(&endpoint.socket_path)?
                 ),
             "issuer original executable or endpoint version changed"
+        );
+        let mut endpoint_sha256 = [0u8; 32];
+        hex::decode_to_slice(&endpoint.exe_sha256, &mut endpoint_sha256)?;
+        ensure!(
+            endpoint_sha256 == self.executable_sha256,
+            "issuer executable authority changed"
+        );
+        verify_held_executable(
+            &self.executable,
+            &self.executable_pin,
+            &self.executable_sha256,
+            until,
+        )?;
+        ensure!(
+            same(
+                &self.executable_pin,
+                &std::fs::metadata(format!("/proc/{}/exe", endpoint.peer_pid))?
+            ) && same(&self.cgroup_pin, &self.cgroup_owner.metadata()?)
+                && same(
+                    &self.cgroup_pin,
+                    &std::fs::symlink_metadata(&endpoint.cgroup_path)?
+                )
+                && same(
+                    &self.socket_pin,
+                    &std::fs::symlink_metadata(&endpoint.socket_path)?
+                ),
+            "issuer executable or endpoint changed after hash"
         );
         ensure!(
             tick(endpoint.peer_pid)? == endpoint.start_tick
@@ -1992,6 +2065,41 @@ mod production_tests {
             expires_monotonic_ns: 1,
         }
     }
+    #[test]
+    fn held_executable_boundary_rejects_wrong_content_authority_on_real_fd() {
+        use std::io::{Seek, SeekFrom};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owned-executable");
+        let bytes = b"original executable bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let pin = file.metadata().unwrap();
+        let trusted: [u8; 32] = Sha256::digest(bytes).into();
+        let mut wrong = trusted;
+        wrong[0] ^= 1;
+        file.seek(SeekFrom::Start(7)).unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        let healthy = verify_held_executable(&file, &pin, &trusted, until).is_ok();
+        let refused = verify_held_executable(&file, &pin, &wrong, until).is_err();
+        let repeated = verify_held_executable(&file, &pin, &trusted, until).is_ok();
+        let offset = file.stream_position().unwrap();
+        let expired = verify_held_executable(&file, &pin, &trusted, Instant::now()).is_err();
+        // Actual same-inode content change; current metadata is independently observed.
+        // This is not a claim that the original numeric version remained unchanged.
+        std::fs::write(&path, b"modified executable bytes").unwrap();
+        let current = file.metadata().unwrap();
+        let changed = verify_held_executable(&file, &current, &trusted, until).is_err();
+        drop(file);
+        directory.close().unwrap();
+        assert!(healthy && repeated);
+        assert!(
+            refused,
+            "metadata matched but wrong full content authority was accepted"
+        );
+        assert_eq!(offset, 7);
+        assert!(expired && changed);
+    }
+
     #[test]
     fn native_stop_binding_refuses_missing_and_foreign_actual_backend_arc() {
         let make = || -> BackendOwner {
