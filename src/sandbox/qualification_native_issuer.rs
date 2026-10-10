@@ -1,6 +1,6 @@
 //! Actual requester identity and reciprocal local issuer qualification, no VM.
 use super::native_issuer::*;
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -115,12 +115,10 @@ fn native_issuer_receipt_codec_refuses_duplicate_and_missing_original_fields() {
         assert!(serde_json::from_str::<Receipt>(&duplicated).is_err());
     }
     assert!(serde_json::from_str::<Receipt>(&raw.replace("\"grant_id\":null,", "")).is_err());
-    assert!(
-        serde_json::from_str::<Receipt>(
-            &raw.replace("\"grant_id\":null", "\"grant_id\":\"invented\"")
-        )
-        .is_err()
-    );
+    assert!(serde_json::from_str::<Receipt>(
+        &raw.replace("\"grant_id\":null", "\"grant_id\":\"invented\"")
+    )
+    .is_err());
     assert!(serde_json::from_str::<Receipt>(&raw.replacen("{", "{\"extra\":true,", 1)).is_err());
 }
 
