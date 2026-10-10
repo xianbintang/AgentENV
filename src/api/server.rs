@@ -113,6 +113,24 @@ async fn optional_connect_body(request: Request, next: Next) -> Response {
     next.run(Request::from_parts(parts, body)).await
 }
 
+async fn native_deployment_routes(
+    axum::extract::State(native): axum::extract::State<bool>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if native
+        && !crate::native_deployment::route_allowed(request.method().as_str(), request.uri().path())
+    {
+        return (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            axum::Json(serde_json::json!({"error":"unsupported_native_deployment_operation"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,22 +234,4 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
-}
-
-async fn native_deployment_routes(
-    axum::extract::State(native): axum::extract::State<bool>,
-    request: axum::extract::Request,
-    next: middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    if native
-        && !crate::native_deployment::route_allowed(request.method().as_str(), request.uri().path())
-    {
-        return (
-            axum::http::StatusCode::NOT_IMPLEMENTED,
-            axum::Json(serde_json::json!({"error":"unsupported_native_deployment_operation"})),
-        )
-            .into_response();
-    }
-    next.run(request).await
 }

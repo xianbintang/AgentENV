@@ -306,7 +306,7 @@ pub struct Executor {
 }
 
 enum ExecutorBackend {
-    Envd(EnvdInstance),
+    Envd(Box<EnvdInstance>),
     Native(Arc<NativeClient>),
 }
 impl Executor {
@@ -315,7 +315,7 @@ impl Executor {
     }
     pub(super) fn new(envd_instance: EnvdInstance) -> Self {
         Self {
-            backend: ExecutorBackend::Envd(envd_instance),
+            backend: ExecutorBackend::Envd(Box::new(envd_instance)),
             root_user: false,
         }
     }
