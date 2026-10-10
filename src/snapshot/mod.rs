@@ -1,4 +1,6 @@
 mod artifact_cache;
+#[cfg(test)]
+pub(crate) use artifact_cache::LocalArtifactCache;
 pub mod image_export;
 mod manager;
 #[doc(hidden)]

@@ -59,7 +59,7 @@ rocksdb = "0.24.0"
 tower = "0.5.2"
 anyhow = "1.0.100"
 tempfile = "3.22.0"
-nix = { version = "0.31", features = ["sched", "mount", "fs", "signal", "user", "resource", "uio"] }
+nix = { version = "0.31", features = ["sched", "mount", "fs", "signal", "user", "resource", "uio", "socket", "poll", "time", "feature"] }
 libc = "0.2"
 rtnetlink = "0.20"
 netlink-packet-route = "0.28"
@@ -150,3 +150,6 @@ debug = 0
 [profile.test.package.librocksdb-sys]
 opt-level = 3
 debug = 0
+
+[patch.crates-io]
+tikv-jemalloc-sys = { path = "vendor/tikv-jemalloc-sys" }

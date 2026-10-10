@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use nix::errno::Errno;
 use parking_lot::RwLock;
 use std::ffi::CString;
@@ -21,62 +22,222 @@ use crate::sys;
 
 #[async_trait]
 pub trait CachedFsSource: Send + Sync {
-    async fn open(&self, pathname: &str, flags: u32, mode: u32) -> Result<Arc<dyn VirtualFile>>;
+    fn open<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        pathname: &'life1 str,
+        flags: u32,
+        mode: u32,
+    ) -> BoxFuture<'async_trait, Result<Arc<dyn VirtualFile>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
-    async fn mkdir(&self, _pathname: &str, _mode: u32) -> Result<()> {
-        bail!("mkdir is not supported for this cached source");
+    fn mkdir<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _pathname: &'life1 str,
+        _mode: u32,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("mkdir is not supported for this cached source");
+        })
     }
 
-    async fn rmdir(&self, _pathname: &str) -> Result<()> {
-        bail!("rmdir is not supported for this cached source");
+    fn rmdir<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _pathname: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("rmdir is not supported for this cached source");
+        })
     }
 
-    async fn readlink(&self, _pathname: &str) -> Result<PathBuf> {
-        bail!("readlink is not supported for this cached source");
+    fn readlink<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _pathname: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<PathBuf>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("readlink is not supported for this cached source");
+        })
     }
 
-    async fn stat(&self, _pathname: &str) -> Result<std::fs::Metadata> {
-        bail!("stat is not supported for this cached source");
+    fn stat<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _pathname: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<std::fs::Metadata>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("stat is not supported for this cached source");
+        })
     }
 
-    async fn lstat(&self, _pathname: &str) -> Result<std::fs::Metadata> {
-        bail!("lstat is not supported for this cached source");
+    fn lstat<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _pathname: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<std::fs::Metadata>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("lstat is not supported for this cached source");
+        })
     }
 
-    async fn statfs(&self, _pathname: &str) -> Result<libc::statfs> {
-        bail!("statfs is not supported for this cached source");
+    fn statfs<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _pathname: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<libc::statfs>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("statfs is not supported for this cached source");
+        })
     }
 
-    async fn statvfs(&self, _pathname: &str) -> Result<libc::statvfs> {
-        bail!("statvfs is not supported for this cached source");
+    fn statvfs<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _pathname: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<libc::statvfs>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("statvfs is not supported for this cached source");
+        })
     }
 
-    async fn opendir(&self, _pathname: &str) -> Result<Vec<String>> {
-        bail!("opendir is not supported for this cached source");
+    fn opendir<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _pathname: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<Vec<String>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("opendir is not supported for this cached source");
+        })
     }
 
-    async fn unlink(&self, _pathname: &str) -> Result<()> {
-        bail!("unlink is not supported for this cached source");
+    fn unlink<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _pathname: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("unlink is not supported for this cached source");
+        })
     }
 
-    async fn access(&self, _pathname: &str, _mode: i32) -> Result<()> {
-        bail!("access is not supported for this cached source");
+    fn access<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _pathname: &'life1 str,
+        _mode: i32,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("access is not supported for this cached source");
+        })
     }
 
-    async fn getxattr(&self, _path: &str, _name: &str) -> Result<Vec<u8>> {
-        bail!("getxattr is not supported for this cached source");
+    fn getxattr<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _path: &'life1 str,
+        _name: &'life2 str,
+    ) -> BoxFuture<'async_trait, Result<Vec<u8>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("getxattr is not supported for this cached source");
+        })
     }
 
-    async fn listxattr(&self, _path: &str) -> Result<Vec<String>> {
-        bail!("listxattr is not supported for this cached source");
+    fn listxattr<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _path: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<Vec<String>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("listxattr is not supported for this cached source");
+        })
     }
 
-    async fn setxattr(&self, _path: &str, _name: &str, _value: &[u8], _flags: i32) -> Result<()> {
-        bail!("setxattr is not supported for this cached source");
+    fn setxattr<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        _path: &'life1 str,
+        _name: &'life2 str,
+        _value: &'life3 [u8],
+        _flags: i32,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("setxattr is not supported for this cached source");
+        })
     }
 
-    async fn removexattr(&self, _path: &str, _name: &str) -> Result<()> {
-        bail!("removexattr is not supported for this cached source");
+    fn removexattr<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _path: &'life1 str,
+        _name: &'life2 str,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            bail!("removexattr is not supported for this cached source");
+        })
     }
 }
 

@@ -1,3 +1,4 @@
+use futures::future::BoxFuture;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -142,7 +143,13 @@ pub trait SnapshotRepository: Send + Sync {
     ///
     /// Backends should reject records that already contain a committed artifact payload and should
     /// only accept records whose source kind is template.
-    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
+    fn create<'life0, 'async_trait>(
+        &'life0 self,
+        record: SnapshotRecord,
+    ) -> BoxFuture<'async_trait, RepositoryResult<SnapshotRecord>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Publishes manager-owned local artifacts into committed repository state.
     ///
@@ -163,12 +170,15 @@ pub trait SnapshotRepository: Send + Sync {
     /// for this snapshot; the backend awaits it after the layer uploads and
     /// before building the manifest, so the recording VM overlaps the upload
     /// phase instead of serializing ahead of it.
-    async fn publish(
-        &self,
+    fn publish<'life0, 'async_trait>(
+        &'life0 self,
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
-    ) -> RepositoryResult<SnapshotRecord>;
+    ) -> BoxFuture<'async_trait, RepositoryResult<SnapshotRecord>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Like `publish`, retaining any transformed local layer files until the
     /// caller finishes best-effort P2P publication after the durable commit.
@@ -185,10 +195,23 @@ pub trait SnapshotRepository: Send + Sync {
     }
 
     /// Loads one snapshot record by repository id or alias.
-    async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>>;
+    fn get<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        id_or_alias: &'life1 str,
+    ) -> BoxFuture<'async_trait, RepositoryResult<Option<SnapshotRecord>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Lists snapshot records matching the provided filter.
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
+    fn list<'life0, 'async_trait>(
+        &'life0 self,
+        filter: SnapshotListFilter,
+    ) -> BoxFuture<'async_trait, RepositoryResult<Vec<SnapshotRecord>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Deletes one snapshot record by repository id or alias.
     ///
@@ -197,25 +220,50 @@ pub trait SnapshotRepository: Send + Sync {
     ///
     /// For committed records, implementations should also remove per-snapshot committed artifacts and
     /// any alias binding that still points at the deleted id.
-    async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()>;
+    fn delete<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        id_or_alias: &'life1 str,
+    ) -> BoxFuture<'async_trait, RepositoryResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Resolves a human-readable alias to the current snapshot id.
-    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
+    fn resolve_alias<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        alias: &'life1 str,
+    ) -> BoxFuture<'async_trait, RepositoryResult<Option<SnapshotId>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Atomically transitions one template build from waiting to building.
     ///
     /// Backends should reject non-template records and template records that are no longer waiting.
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord>;
+    fn try_start_build<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        id: &'life1 SnapshotId,
+    ) -> BoxFuture<'async_trait, RepositoryResult<SnapshotRecord>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Marks one template build as failed.
     ///
     /// Backends should preserve the existing record identity, alias, resources, and source while
     /// recording the failure state and reason.
-    async fn mark_build_error(
-        &self,
-        id: &SnapshotId,
+    fn mark_build_error<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        id: &'life1 SnapshotId,
         reason: TemplateBuildErrorReason,
-    ) -> RepositoryResult<()>;
+    ) -> BoxFuture<'async_trait, RepositoryResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Atomically replaces the complete build log file.
     async fn write_build_logs(
@@ -358,5 +406,11 @@ pub trait SnapshotRepository: Send + Sync {
 ///   partially written derived configs
 pub trait SnapshotRuntimeResolver: Send + Sync {
     /// Resolves one committed snapshot record into a runtime-ready view for the current node.
-    async fn resolve(&self, snapshot: Arc<SnapshotRecord>) -> RepositoryResult<RunnableSnapshot>;
+    fn resolve<'life0, 'async_trait>(
+        &'life0 self,
+        snapshot: Arc<SnapshotRecord>,
+    ) -> BoxFuture<'async_trait, RepositoryResult<RunnableSnapshot>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 }

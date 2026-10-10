@@ -164,10 +164,26 @@ mod tests {
 
     fn current_capability_status() -> Result<Vec<String>> {
         let status = fs::read_to_string("/proc/thread-self/status")?;
-        Ok(CAPABILITY_STATUS_FIELDS
-            .iter()
-            .map(|field| status_field(&status, field).to_string())
-            .collect())
+        Ok([
+            "CapInh:",
+            "CapPrm:",
+            "CapEff:",
+            "CapAmb:",
+            "CapBnd:",
+            "NoNewPrivs:",
+        ]
+        .iter()
+        .map(|field| status_field(&status, field).to_string())
+        .collect())
+    }
+
+    fn securebits() -> Result<i32> {
+        // SAFETY: PR_GET_SECUREBITS returns scalar thread state, no pointers.
+        let bits = unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0) };
+        if bits < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(bits)
     }
 
     /// Status fields whose values prove the scoped-spawn capability contract.
@@ -218,17 +234,29 @@ mod tests {
     #[tokio::test]
     async fn scoped_spawn_clears_child_capabilities_without_mutating_caller() -> Result<()> {
         let caller_capabilities = current_capability_status()?;
+        let caller_securebits = securebits()?;
         let mut command = tokio::process::Command::new("sh");
         command
-            .args(["-c", "cat /proc/thread-self/status"])
+            .args(["-c", "exec sh -c 'cat /proc/thread-self/status'"])
             .stdout(Stdio::piped());
 
         let child = spawn_tokio_command_scoped(command, &[], || Ok(())).await?;
         let output = child.wait_with_output().await?;
 
         assert!(output.status.success());
-        assert_child_has_no_capabilities(&String::from_utf8(output.stdout)?);
+        let status = String::from_utf8(output.stdout)?;
+        assert_child_has_no_capabilities(&status);
+        assert_eq!(status_field(&status, "NoNewPrivs:"), "1");
+        if nix::unistd::Uid::effective().is_root() {
+            let expected = if linux_cap::has_effective_capabilities(&[8])? {
+                "0000000000000000"
+            } else {
+                &caller_capabilities[4]
+            };
+            assert_eq!(status_field(&status, "CapBnd:"), expected);
+        }
         assert_eq!(current_capability_status()?, caller_capabilities);
+        assert_eq!(securebits()?, caller_securebits);
         Ok(())
     }
 
@@ -259,6 +287,93 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires UID0 without CAP_SETPCAP and initially unlocked NOROOT"]
+    fn root_without_setpcap_refuses_scope_before_operation_and_preserves_caller() -> Result<()> {
+        const CAP_SETPCAP: i32 = 8;
+        anyhow::ensure!(
+            nix::unistd::Uid::effective().is_root(),
+            "test requires UID0"
+        );
+        anyhow::ensure!(
+            !linux_cap::has_effective_capabilities(&[CAP_SETPCAP])?,
+            "test requires CAP_SETPCAP absent"
+        );
+        let caller_capabilities = current_capability_status()?;
+        let caller_securebits = securebits()?;
+        anyhow::ensure!(caller_securebits & 3 == 0, "test requires unlocked NOROOT");
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = called.clone();
+        let result = run_with_scoped_capabilities(&[], move || {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(result.is_err(), "missing authority must refuse scoping");
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(current_capability_status()?, caller_capabilities);
+        assert_eq!(securebits()?, caller_securebits);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed UID0 two-capability policy with locked NOROOT and NNP"]
+    fn installed_locked_root_scopes_double_exec_without_setpcap_and_preserves_caller() -> Result<()>
+    {
+        anyhow::ensure!(
+            nix::unistd::Uid::effective().is_root(),
+            "test requires UID0"
+        );
+        let caller = current_capability_status()?;
+        let bits = securebits()?;
+        anyhow::ensure!(bits & 3 == 3, "test requires locked NOROOT");
+        anyhow::ensure!(
+            !linux_cap::has_effective_capabilities(&[8])?,
+            "test requires no SETPCAP"
+        );
+        for field in caller.iter().take(5) {
+            anyhow::ensure!(
+                field == "0000000000201000",
+                "test requires exact installed two-capability sets"
+            );
+        }
+        anyhow::ensure!(caller[5] == "1", "test requires installed NNP");
+        for (requested, expected) in [
+            (&[][..], "0000000000000000"),
+            (&[CAP_NET_ADMIN][..], "0000000000001000"),
+        ] {
+            let output = run_with_scoped_capabilities(requested, || {
+                anyhow::ensure!(securebits()? & 3 == 3, "launcher lost locked NOROOT");
+                let sets = linux_cap::CapabilitySets::current()?;
+                anyhow::ensure!(
+                    sets.effective(CAP_NET_ADMIN)? == !requested.is_empty(),
+                    "thread capability observation mismatch"
+                );
+                Ok(Command::new("sh")
+                    .args(["-c", "exec sh -c 'cat /proc/thread-self/status'"])
+                    .output()?)
+            })?;
+            assert!(output.status.success());
+            let status = String::from_utf8(output.stdout)?;
+            for field in CAPABILITY_STATUS_FIELDS {
+                assert_eq!(status_field(&status, field), expected);
+            }
+            assert_eq!(status_field(&status, "CapBnd:"), caller[4]);
+            assert_eq!(status_field(&status, "NoNewPrivs:"), "1");
+            assert_eq!(current_capability_status()?, caller);
+            assert_eq!(securebits()?, bits);
+        }
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let result = run_with_scoped_capabilities(&[8], || {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(current_capability_status()?, caller);
+        assert_eq!(securebits()?, bits);
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires CAP_NET_ADMIN to delegate a capability to the child"]
     fn scoped_command_receives_only_requested_capability() -> Result<()> {
         anyhow::ensure!(
@@ -267,9 +382,10 @@ mod tests {
         );
 
         let caller_capabilities = current_capability_status()?;
+        let caller_securebits = securebits()?;
         let output = run_with_scoped_capabilities(&[CAP_NET_ADMIN], || {
             Ok(Command::new("sh")
-                .args(["-c", "cat /proc/thread-self/status"])
+                .args(["-c", "exec sh -c 'cat /proc/thread-self/status'"])
                 .output()?)
         })?;
         let status = String::from_utf8(output.stdout)?;
@@ -284,7 +400,17 @@ mod tests {
                 "child received an unexpected {field} value"
             );
         }
+        assert_eq!(status_field(&status, "NoNewPrivs:"), "1");
+        if nix::unistd::Uid::effective().is_root() {
+            let expected = if linux_cap::has_effective_capabilities(&[8])? {
+                "0000000000001000"
+            } else {
+                &caller_capabilities[4]
+            };
+            assert_eq!(status_field(&status, "CapBnd:"), expected);
+        }
         assert_eq!(current_capability_status()?, caller_capabilities);
+        assert_eq!(securebits()?, caller_securebits);
         Ok(())
     }
 
@@ -298,6 +424,7 @@ mod tests {
 
         let caller_namespace = fs::read_link("/proc/thread-self/ns/net")?;
         let caller_capabilities = current_capability_status()?;
+        let caller_securebits = securebits()?;
         let netns = thread::spawn(|| -> Result<fs::File> {
             nix::sched::unshare(CloneFlags::CLONE_NEWNET)?;
             Ok(fs::File::open("/proc/thread-self/ns/net")?)
@@ -328,6 +455,7 @@ mod tests {
         assert_child_has_no_capabilities(child_status);
         assert_eq!(fs::read_link("/proc/thread-self/ns/net")?, caller_namespace);
         assert_eq!(current_capability_status()?, caller_capabilities);
+        assert_eq!(securebits()?, caller_securebits);
         Ok(())
     }
 }

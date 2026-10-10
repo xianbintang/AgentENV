@@ -359,7 +359,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         let root = tempfile::tempdir()?;
-        let repository = PosixFsBackend::new(PosixFsBackendConfig {
+        let repository = PosixFsBackend::new_owned_fixture(PosixFsBackendConfig {
             root: root.path().join("repository"),
             cache_root: Some(root.path().join("cache")),
             runtime_cache_root: None,
@@ -414,7 +414,7 @@ mod tests {
             cache_root: Some(root.path().join("cache")),
             runtime_cache_root: None,
         };
-        let repository = PosixFsBackend::new(config.clone())?.repository();
+        let repository = PosixFsBackend::new_owned_fixture(config.clone())?.repository();
         let id = SnapshotId::generate();
         repository
             .create(crate::snapshot::SnapshotRecord::template_waiting(
@@ -439,7 +439,7 @@ mod tests {
             None,
             "late write must not change the closed stream",
         );
-        let reader = PosixFsBackend::new(config)?.repository();
+        let reader = PosixFsBackend::new_owned_fixture(config)?.repository();
         let persisted = reader.read_build_logs(&id).await?;
         assert_eq!(persisted.len(), 600);
         repository.write_build_logs(&id, persisted.clone()).await?;
@@ -462,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn build_logs_dropped_session_flushes_and_releases_buffer() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let repository = PosixFsBackend::new(PosixFsBackendConfig {
+        let repository = PosixFsBackend::new_owned_fixture(PosixFsBackendConfig {
             root: root.path().join("repository"),
             cache_root: Some(root.path().join("cache")),
             runtime_cache_root: None,

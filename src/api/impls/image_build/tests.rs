@@ -22,7 +22,7 @@ pub(super) async fn test_api(
     };
 
     let root = tempfile::tempdir()?;
-    let backend = PosixFsBackend::new(PosixFsBackendConfig {
+    let backend = PosixFsBackend::new_owned_fixture(PosixFsBackendConfig {
         root: root.path().join("repository"),
         cache_root: Some(root.path().join("cache")),
         runtime_cache_root: None,
@@ -36,10 +36,12 @@ pub(super) async fn test_api(
     let mut metadata = SnapshotPublishMetadata::mock();
     metadata.alias = Some(crate::snapshot::SnapshotAlias::parse("test-template")?);
     let record = manager.publish(metadata, manifest, None).await?;
-    let orchestrator = Orchestrator::new(
+    let image_services = crate::image::cache::test_support::owned_real_image_services();
+    let orchestrator = Orchestrator::new_native_qualification_fixture(
         InMemoryMetadataStore::new(),
         FirecrackerSandboxFactory::new(),
         FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes")),
+        image_services.runtime_refs,
     )
     .await?;
     let volumes = VolumeManager::open_with_repository_and_limits(
@@ -52,7 +54,10 @@ pub(super) async fn test_api(
         orchestrator,
         manager.clone(),
         Arc::new(TemplateBuilder::new()),
-        Arc::new(ImageResolver::new(&AppConfig::default())),
+        Arc::new(ImageResolver::with_store(
+            &AppConfig::default(),
+            image_services.source_images,
+        )),
         Arc::new(volumes),
         None,
         Vec::new(),

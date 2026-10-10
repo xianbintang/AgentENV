@@ -29,6 +29,7 @@
 //! User-facing shortnames are normalized by `src/image/reference.rs` before
 //! reaching this module.
 
+use futures::future::BoxFuture;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -170,16 +171,25 @@ pub(crate) trait ImageConversion: Send + Sync {
     /// `layer.commit` can be hard-linked into the cache (avoids EXDEV).
     fn create_temp_staging_dir(&self) -> Result<tempfile::TempDir>;
 
-    async fn lookup_converted_layer(
-        &mut self,
-        key: &LayerConversionKey,
-    ) -> Result<Option<LocalLayer>>;
+    fn lookup_converted_layer<'life0, 'life1, 'async_trait>(
+        &'life0 mut self,
+        key: &'life1 LayerConversionKey,
+    ) -> BoxFuture<'async_trait, Result<Option<LocalLayer>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
-    async fn store_converted_layer(
-        &mut self,
-        key: &LayerConversionKey,
-        temp_commit: &Path,
-    ) -> Result<LocalLayer>;
+    fn store_converted_layer<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 mut self,
+        key: &'life1 LayerConversionKey,
+        temp_commit: &'life2 Path,
+    ) -> BoxFuture<'async_trait, Result<LocalLayer>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait;
 }
 
 pub(crate) async fn fetch_oci_manifest(

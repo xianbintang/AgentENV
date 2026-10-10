@@ -9,8 +9,24 @@ pub mod manifest;
 mod metrics;
 #[cfg(test)]
 pub(crate) mod mock;
+mod native_control;
+mod native_issuer;
+pub(crate) mod native_worker_ingress;
+pub use native_issuer::{NativeIssuerRequester, NativeProfilePromotion, ReservedGrant};
+mod native_download;
+mod native_metadata;
+mod native_process;
+pub use native_metadata::{
+    NativeFileEntry, NativeFileTime, NativeFileType, NativeFileVersion, NativeListPage,
+    NativeListSummary, NativeMetadataReceipt, NativeStatReceipt,
+};
+pub use native_process::NativeMetadataHandle;
 mod network;
 mod process;
+#[cfg(all(test, target_os = "linux"))]
+mod qualification_native_issuer;
+#[cfg(all(test, target_os = "linux"))]
+mod qualification_native_transfer;
 mod ublk;
 
 use std::{collections::HashMap, path::PathBuf};
@@ -32,7 +48,9 @@ pub use extra_drive::{
     normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
     validate_sub_path, ExtraDrive,
 };
+pub(crate) use firecracker::native_guest::{NativeArtifactDescriptor, NativeGuestProfile};
 pub(crate) use firecracker::record_startup_pack;
+pub(crate) use firecracker::NativeExecutionStopped;
 pub use firecracker::{
     FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
@@ -41,6 +59,14 @@ pub use firecracker::{
 pub use logs::SandboxLogEntry;
 pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 pub use metrics::SandboxMetric;
+pub use native_control::NativeControl;
+pub(crate) use native_control::Request as NativeControlRequest;
+pub use native_download::NativeDownloadReader;
+pub use native_process::{
+    NativeDownloadHandle, NativeDownloadOutcome, NativeDownloadProgress, NativeFileHandle,
+    NativeFileOutcome, NativeIdentity, NativeStatus, NativeUploadHandle, NativeUploadObservation,
+    NativeUploadOutcome, NativeUploadProgress,
+};
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{
     BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,

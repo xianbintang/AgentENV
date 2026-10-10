@@ -14,6 +14,8 @@ pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
     SandboxPersistenceError, SandboxPersister,
 };
+#[cfg(test)]
+pub(crate) use persistence::{RecordingCall, RecordingPersister};
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;
 pub use store::{
@@ -94,6 +96,9 @@ pub enum OrchestratorError {
         sandbox_id: SandboxId,
         timeout: String,
     },
+
+    #[error("failed launch cleanup provenance capacity exhausted; original debt retained")]
+    FailedLaunchCleanupCapacity,
 
     #[error("internal error: {0}")]
     InternalError(String),

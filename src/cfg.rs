@@ -76,6 +76,17 @@ pub(crate) fn regctl_path(deps_path: &Path) -> PathBuf {
 
 #[derive(Debug, Clone, Config)]
 pub struct AppConfig {
+    /// Explicit native-only root service; default legacy runtime remains nonroot.
+    #[config(default = "legacy")]
+    pub deployment_mode: String,
+    /// Protected reciprocal Worker issuer provisioning; absence keeps native create unavailable.
+    pub native_issuer_requester: Option<PathBuf>,
+    /// Opt-in protected local Worker ingress; does not enable public create.
+    #[config(default = false)]
+    pub native_worker_ingress: bool,
+    /// Explicit bounded provision/activation before the unchanged ingress bootstrap.
+    #[config(default = false)]
+    pub native_worker_provision: bool,
     #[config(
         env = "AENV_HOME_PATH",
         parse_env = parse_required_path,
@@ -161,6 +172,8 @@ pub struct PosixFsBackendConfig {
 
 #[derive(Debug, Clone, Config)]
 pub struct FirecrackerConfig {
+    /// Explicit fresh-only native guest descriptor; protected server-owned input.
+    pub native_guest_profile: Option<PathBuf>,
     pub binary_path: Option<PathBuf>,
     pub boot_args: Option<String>,
     pub allowed_extra_boot_args_prefixes: Option<Vec<String>>,
@@ -865,6 +878,9 @@ impl AppConfig {
         self.image.cache.layout()
     }
 
+    pub fn is_native_root(&self) -> bool {
+        self.deployment_mode == "native-root"
+    }
     pub fn network_pool_config(&self) -> warm_pool::PoolConfig {
         let pool = &self.pool.network;
 
@@ -1014,6 +1030,20 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        if !matches!(self.deployment_mode.as_str(), "legacy" | "native-root") {
+            bail!("invalid deployment mode");
+        }
+        if self.native_worker_provision && !self.native_worker_ingress {
+            bail!("native Worker provisioning requires protected ingress");
+        }
+        if self.native_worker_ingress
+            && (!self.is_native_root() || self.native_issuer_requester.is_none())
+        {
+            bail!("native Worker ingress requires native-root and protected requester");
+        }
+        if self.is_native_root() {
+            crate::native_deployment::validate_policy(self)?;
+        }
         self.validate_pool_config()?;
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;
@@ -1348,6 +1378,7 @@ impl ConfigManager {
     }
 
     fn load_config_file(path: &Path) -> Result<AppConfig> {
+        let native_source = crate::native_deployment::ConfigurationSource::capture(path);
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let mut config = AppConfig::builder()
             .env()
@@ -1356,6 +1387,9 @@ impl ConfigManager {
             .with_context(|| format!("load config {}", path.display()))?;
         config.normalize(config_dir)?;
         config.validate()?;
+        if config.is_native_root() {
+            native_source?.verify()?;
+        }
 
         Ok(config)
     }

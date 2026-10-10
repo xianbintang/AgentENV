@@ -56,6 +56,20 @@ impl PosixFsBackend {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_owned_fixture(config: PosixFsBackendConfig) -> Result<Self> {
+        let cache_root = config
+            .cache_root
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("owned fixture requires an explicit cache root"))?;
+        let cache = LocalArtifactCache::new(cache_root, None)?;
+        Ok(Self::from_parts(
+            config,
+            crate::image::cache::test_support::owned_real_image_services().overlaybd_layers,
+            cache,
+        ))
+    }
+
     /// Builds the POSIX backend bundle using a shared node-local artifact cache.
     ///
     /// `runtime_image_hints` is a node-local runtime-acceleration hint (e.g. the

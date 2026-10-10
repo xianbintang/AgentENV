@@ -355,12 +355,19 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_manager(root: &Path) -> SnapshotManager {
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.join("repository"),
-            cache_root: Some(root.join("runtime-cache")),
-            runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
+        let backend = PosixFsBackend::from_parts(
+            PosixFsBackendConfig {
+                root: root.join("repository"),
+                cache_root: Some(root.join("runtime-cache")),
+                runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+            },
+            crate::image::cache::test_support::owned_real_image_services().overlaybd_layers,
+            crate::snapshot::artifact_cache::LocalArtifactCache::new(
+                root.join("runtime-cache"),
+                None,
+            )
+            .expect("artifact cache"),
+        );
         let (repository, runtime_resolver) = backend.into_parts();
         SnapshotManager::from_parts(repository, runtime_resolver, None)
     }
@@ -435,12 +442,19 @@ mod tests {
     #[tokio::test]
     async fn publish_advertises_snapshot_artifacts_to_p2p_after_commit() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("runtime-cache")),
-            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
+        let backend = PosixFsBackend::from_parts(
+            PosixFsBackendConfig {
+                root: tempdir.path().join("repository"),
+                cache_root: Some(tempdir.path().join("runtime-cache")),
+                runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
+            },
+            crate::image::cache::test_support::owned_real_image_services().overlaybd_layers,
+            crate::snapshot::artifact_cache::LocalArtifactCache::new(
+                tempdir.path().join("runtime-cache"),
+                None,
+            )
+            .expect("artifact cache"),
+        );
         let (repository, runtime_resolver) = backend.into_parts();
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(repository, runtime_resolver, Some(p2p.clone()));

@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{sync::Mutex, thread};
@@ -95,8 +95,11 @@ pub struct MockBehavior {
     metrics_sampler: Mutex<Option<MetricsSampler>>,
     logs_reader: Mutex<Option<LogsReader>>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
+    #[cfg(test)]
+    startup_artifact_override: Mutex<Option<RuntimeArtifactSet>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
+    native_control_ready: AtomicBool,
 }
 
 impl MockBehavior {
@@ -108,6 +111,9 @@ impl MockBehavior {
         *self.metrics_sampler.lock().unwrap() = Some(sampler);
     }
 
+    pub fn set_native_control_ready(&self, ready: bool) {
+        self.native_control_ready.store(ready, Ordering::Release);
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -122,6 +128,14 @@ impl MockBehavior {
             .lock()
             .expect("on_operation mutex poisoned")
             .insert(operation, hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_startup_artifacts(&self, artifacts: RuntimeArtifactSet) {
+        *self
+            .startup_artifact_override
+            .lock()
+            .expect("startup artifact mutex poisoned") = Some(artifacts);
     }
 
     pub fn set_runtime_info(&self, runtime_info: SandboxRuntimeInfo) {
@@ -259,6 +273,8 @@ impl MockBehavior {
     }
 
     fn apply_sync(&self, operation: MockOperation) -> Result<()> {
+        #[cfg(test)]
+        self.run_operation_hook(operation);
         Self::run_sync_action(
             self.pop_action(operation),
             |message| anyhow!(message),
@@ -276,9 +292,21 @@ pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
     volumes_frozen: bool,
+    native_control: Option<super::NativeControl>,
 }
 
 impl MockSandboxBackend {
+    pub fn new_with_native_control(
+        behavior: Arc<MockBehavior>,
+        control: super::NativeControl,
+    ) -> Self {
+        Self {
+            behavior,
+            host_ip: None,
+            volumes_frozen: false,
+            native_control: Some(control),
+        }
+    }
     pub fn new(behavior: Arc<MockBehavior>) -> Self {
         Self::new_with_host_ip(behavior, Some(std::net::Ipv4Addr::new(127, 0, 0, 1)))
     }
@@ -291,6 +319,7 @@ impl MockSandboxBackend {
             behavior,
             host_ip,
             volumes_frozen: false,
+            native_control: None,
         }
     }
 }
@@ -320,6 +349,10 @@ impl SandboxBackend for MockSandboxBackend {
     ) -> Option<futures::future::BoxFuture<'static, Result<super::SandboxMetric>>> {
         let sampler = self.behavior.metrics_sampler.lock().unwrap().clone();
         sampler.map(|sample| sample())
+    }
+
+    fn native_control(&self) -> Option<super::NativeControl> {
+        self.native_control.clone()
     }
 
     async fn start(&mut self) -> Result<()> {
@@ -443,11 +476,25 @@ impl SandboxBackend for MockSandboxBackend {
         self.host_ip
     }
 
+    fn native_control_ready(&self) -> bool {
+        self.behavior.native_control_ready.load(Ordering::Acquire)
+    }
+
     fn runtime_info(&self) -> SandboxRuntimeInfo {
         self.behavior.runtime_info()
     }
 
     fn startup_artifacts(&self) -> RuntimeArtifactSet {
+        #[cfg(test)]
+        if let Some(artifacts) = self
+            .behavior
+            .startup_artifact_override
+            .lock()
+            .expect("startup artifact mutex poisoned")
+            .as_ref()
+        {
+            return artifacts.clone();
+        }
         RuntimeArtifactSet::from_overlaybd_image_configs(self.behavior.source_config_paths())
     }
 
@@ -541,5 +588,44 @@ impl SandboxBackendFactory for MockBackendFactory {
         _state: serde_json::Value,
     ) -> Result<Arc<dyn PausedSandboxState>> {
         Ok(Arc::new(MockSnapshot))
+    }
+}
+
+#[cfg(test)]
+mod synchronous_hook_tests {
+    use super::*;
+
+    #[test]
+    fn synchronous_build_hook_observes_attempt_before_refused_action() {
+        let behavior = MockBehavior::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        behavior.set_on_operation(
+            MockOperation::Build,
+            Arc::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        behavior.push_action(
+            MockOperation::Build,
+            MockAction::Fail {
+                message: "original synchronous build refusal".into(),
+            },
+        );
+        let refused = behavior.apply_sync(MockOperation::Build);
+        assert!(refused.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "refusal must not hide the actual original factory attempt"
+        );
+        behavior
+            .apply_sync(MockOperation::BuildFromSnapshot)
+            .unwrap();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a different synchronous operation cannot increment this attempt"
+        );
     }
 }

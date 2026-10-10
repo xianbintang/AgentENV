@@ -50,24 +50,40 @@ pub trait Snapshots<E: std::fmt::Debug + Send + Sync + 'static = ()>:
     /// List snapshots.
     ///
     /// SnapshotsGet - GET /snapshots
-    async fn snapshots_get(
-        &self,
+    fn snapshots_get<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        query_params: &models::SnapshotsGetQueryParams,
-    ) -> Result<SnapshotsGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        query_params: &'life5 models::SnapshotsGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<SnapshotsGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 
     /// SnapshotsSnapshotIdGet - GET /snapshots/{snapshotID}
-    async fn snapshots_snapshot_id_get(
-        &self,
+    fn snapshots_snapshot_id_get<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::SnapshotsSnapshotIdGetPathParams,
-    ) -> Result<SnapshotsSnapshotIdGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::SnapshotsSnapshotIdGetPathParams,
+    ) -> super::ApiFuture<'async_trait, Result<SnapshotsSnapshotIdGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 }

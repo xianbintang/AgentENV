@@ -107,6 +107,11 @@ pub async fn ensure_environment(
     p2p_facade_address: Option<&str>,
 ) -> Result<()> {
     info!("running environment setup");
+    if config.is_native_root() {
+        crate::native_deployment::validate_policy(config)?;
+        kvm::check(config.virtualization_mode)?;
+        return Ok(());
+    }
 
     fs::create_dir_all(&config.runtime_path).with_context(|| {
         format!(

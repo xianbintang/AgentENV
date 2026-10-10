@@ -205,7 +205,7 @@ async fn prepare_specific_snapshot_layer_path(snapshot_layer_path: &Path) -> Res
                     "remove stale overlaybd snapshot layer {}",
                     snapshot_layer_path.display()
                 )
-            })
+            });
         }
     }
     Ok(())

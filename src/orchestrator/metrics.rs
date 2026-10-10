@@ -7,7 +7,7 @@ use crate::types::SandboxResources;
 /// `Orchestrator::metrics_snapshot()`.
 ///
 /// The two creation counters are accumulated incrementally (see
-/// [`OrchestratorCounters`]). All other resource fields are derived directly
+/// `OrchestratorCounters`). All other resource fields are derived directly
 /// from the live sandbox metadata at the time of the snapshot, so they cannot
 /// drift from the orchestrator's actual state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -112,7 +112,7 @@ impl SandboxContribution {
 /// [`OrchestratorMetrics`] snapshot under construction.
 ///
 /// The counter fields (`create_successes` / `create_fails`) are intentionally
-/// untouched and must be filled in by the caller from [`OrchestratorCounters`].
+/// untouched and must be filled in by the caller from `OrchestratorCounters`.
 pub(crate) fn aggregate_resource_metrics(
     metrics: &mut OrchestratorMetrics,
     contribution: SandboxContribution,

@@ -170,6 +170,31 @@ fn volume_drive_slot_id(index: usize) -> String {
 ///
 /// Internal state is managed via the high-level lifecycle methods.
 /// Implements [`SandboxBackend`] for use by the Orchestrator.
+/// Opaque producer evidence for execution cessation, not storage reclamation.
+/// Only this backend can construct it after its actual owned cleanup completes.
+#[derive(Clone)]
+pub struct NativeExecutionStopped {
+    id: SandboxId,
+    profile: super::native_guest::NativeGuestProfile,
+    network_returned: bool,
+}
+impl NativeExecutionStopped {
+    pub(crate) fn sandbox_id(&self) -> SandboxId {
+        self.id
+    }
+    pub(crate) fn profile(&self) -> &super::native_guest::NativeGuestProfile {
+        &self.profile
+    }
+    /// A network slot was returned to its manager; this is not namespace absence.
+    pub fn network_returned(&self) -> bool {
+        self.network_returned
+    }
+    /// Artifact descriptors and persistent storage require independent retirement.
+    pub fn persistent_artifacts_retained(&self) -> bool {
+        true
+    }
+}
+
 pub struct FirecrackerSandbox {
     id: SandboxId,
     launch: LaunchMode,
@@ -183,6 +208,17 @@ pub struct FirecrackerSandbox {
     /// on pause.
     current_custom_extension_params: Option<CustomExtensionParams>,
     envd_instance: Option<EnvdInstance>,
+    native_inputs: Option<std::sync::Arc<super::native_guest::NativeInputs>>,
+    native_artifact: Option<std::sync::Arc<super::native_guest::NativeArtifactDescriptor>>,
+    native_probe: super::native_guest::NativeProbeOwner,
+    native_expires: Option<std::time::Instant>,
+    native_drive_fds: Option<super::instance::NativeDriveFds>,
+    native_execution_stopped: Option<Arc<NativeExecutionStopped>>,
+    native_stop_had_ready_owner: bool,
+    native_stop_started: bool,
+    native_ready_observed: std::sync::OnceLock<()>,
+    native_network_release_unknown: bool,
+    native_network_returned: bool,
     rootfs_runtime: Option<OverlaybdRuntimeHandle>,
     mem_ublk_device: Option<SharedReadOnlyDevice>,
     startup_prefetch_task: Option<super::startup_pack::LocalStartupPrefetch>,
@@ -368,6 +404,14 @@ impl SandboxBackend for FirecrackerSandbox {
         Some(Box::pin(async move { envd.metrics().await }))
     }
 
+    fn native_control(&self) -> Option<super::super::NativeControl> {
+        self.native_probe
+            .client()
+            .map(super::super::NativeControl::new)
+    }
+    fn native_control_ready(&self) -> bool {
+        self.native_probe.client().is_some()
+    }
     async fn start(&mut self) -> Result<()> {
         FirecrackerSandbox::start(self).await
     }
@@ -597,6 +641,10 @@ impl SandboxBackend for FirecrackerSandbox {
         Ok(())
     }
 
+    fn native_execution_stopped(&self) -> Option<Arc<NativeExecutionStopped>> {
+        self.native_execution_stopped.clone()
+    }
+
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr> {
         FirecrackerSandbox::host_interaction_ip(self)
     }
@@ -604,8 +652,8 @@ impl SandboxBackend for FirecrackerSandbox {
     fn runtime_info(&self) -> SandboxRuntimeInfo {
         SandboxRuntimeInfo {
             rootfs_virtual_size: self.current_rootfs_virtual_size,
-            runtime_artifacts: RuntimeArtifactSet::from_overlaybd_image_configs(
-                self.runtime_image_config_paths(),
+            runtime_artifacts: self.artifacts_with_native(
+                RuntimeArtifactSet::from_overlaybd_image_configs(self.runtime_image_config_paths()),
             ),
         }
     }
@@ -615,8 +663,8 @@ impl SandboxBackend for FirecrackerSandbox {
             LaunchMode::Fresh(config) => &config.common,
             LaunchMode::Resume(config) => &config.common,
         };
-        RuntimeArtifactSet::from_overlaybd_image_configs(rootfs_and_extra_drive_image_config_paths(
-            common,
+        self.artifacts_with_native(RuntimeArtifactSet::from_overlaybd_image_configs(
+            rootfs_and_extra_drive_image_config_paths(common),
         ))
     }
 
@@ -644,6 +692,13 @@ impl SandboxBackend for FirecrackerSandbox {
 #[async_trait(?Send)]
 impl SandboxExecutor for FirecrackerSandbox {
     fn executor(&self) -> Result<Executor> {
+        if self.launch.common().native_guest_profile.is_some() {
+            return Ok(Executor::native(
+                self.native_probe
+                    .client()
+                    .context("Native control unavailable")?,
+            ));
+        }
         let envd = self
             .envd_instance
             .as_ref()
@@ -691,6 +746,17 @@ impl FirecrackerSandbox {
         Self::new_with_id(config, SandboxId::new())
     }
 
+    pub(crate) fn new_native_original(
+        config: FirecrackerSandboxConfig,
+        id: SandboxId,
+        expires: std::time::Instant,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            config.common.native_guest_profile.is_some() && std::time::Instant::now() < expires,
+            "native original Worker expiry refused"
+        );
+        Self::build_until(id, LaunchMode::Fresh(config), Some(expires))
+    }
     pub(crate) fn new_with_id(mut config: FirecrackerSandboxConfig, id: SandboxId) -> Result<Self> {
         let (mut physical_drives, volume_drives): (Vec<_>, Vec<_>) =
             std::mem::take(&mut config.common.extra_drives)
@@ -721,7 +787,7 @@ impl FirecrackerSandbox {
     /// Create a sandbox handle that resumes from the provided snapshot config.
     ///
     /// This only prepares the sandbox object and its per-instance workspace.
-    /// Call [`FirecrackerSandbox::start`] or [`FirecrackerSandbox::start_nowait`] to boot it.
+    /// Call [`FirecrackerSandbox::start`] or `FirecrackerSandbox::start_nowait` to boot it.
     #[tracing::instrument(skip(snapshot))]
     pub fn from_snapshot_config(snapshot: &FirecrackerSnapshotConfig) -> Result<Self> {
         Self::from_snapshot_config_with_override(
@@ -785,7 +851,7 @@ impl FirecrackerSandbox {
     /// Create a sandbox handle that boots from a resolved runnable committed snapshot.
     ///
     /// This only prepares the sandbox object and its per-instance workspace.
-    /// Call [`FirecrackerSandbox::start`] or [`FirecrackerSandbox::start_nowait`] to boot it.
+    /// Call [`FirecrackerSandbox::start`] or `FirecrackerSandbox::start_nowait` to boot it.
     pub fn from_snapshot(
         snapshot: &RunnableSnapshot,
         launch_config: &SandboxLaunchConfig,
@@ -875,7 +941,10 @@ impl FirecrackerSandbox {
     /// This only waits for the Firecracker API socket to be available and
     /// returns immediately after VM start command is issued.
     pub(crate) async fn start_nowait(&mut self) -> Result<()> {
-        self.prepare_tools_drive().await?;
+        self.require_native_launch_unsealed()?;
+        if self.launch.common().native_guest_profile.is_none() {
+            self.prepare_tools_drive().await?;
+        }
         self.launch.validate()?;
         trace!("launch config validated");
         match &self.launch {
@@ -910,6 +979,54 @@ impl FirecrackerSandbox {
     /// This should be called after `start_nowait()` if you want to interact with the sandbox.
     #[tracing::instrument(skip(self))]
     pub(crate) async fn wait_for_ready(&self) -> Result<()> {
+        self.require_native_launch_unsealed()?;
+        if let Some(profile) = &self.launch.common().native_guest_profile {
+            self.native_artifact
+                .as_ref()
+                .context("native typed protection")?
+                .verify_captured()?;
+            let pid = u32::try_from(self.fc_instance.pid()?.as_raw()).context("native VMM pid")?;
+            profile
+                .wait_for_ready(
+                    self.work_dir.path(),
+                    pid,
+                    nix::unistd::geteuid().as_raw(),
+                    self.native_expires
+                        .context("Native incarnation unavailable")?,
+                    &self.native_probe,
+                )
+                .await?;
+            // This historical evidence is installed only by the real original
+            // handshake, before manager close can revoke live client readiness.
+            // &self readiness and &mut self stop cannot race on this object;
+            // production also holds the same backend mutex for both calls.
+            self.require_native_launch_unsealed()?;
+            anyhow::ensure!(
+                std::time::Instant::now()
+                    < self
+                        .native_expires
+                        .context("Native incarnation unavailable")?,
+                "native readiness completed beyond original lease"
+            );
+            self.native_artifact
+                .as_ref()
+                .context("native typed protection")?
+                .verify_captured()?;
+            anyhow::ensure!(
+                u32::try_from(self.fc_instance.pid()?.as_raw())? == pid
+                    && self.native_probe.client().is_some(),
+                "native original ready owner changed"
+            );
+            anyhow::ensure!(
+                std::time::Instant::now()
+                    < self
+                        .native_expires
+                        .context("Native incarnation unavailable")?,
+                "native readiness identity validation completed beyond original lease"
+            );
+            self.native_ready_observed.get_or_init(|| ());
+            return Ok(());
+        }
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
@@ -1177,6 +1294,9 @@ impl FirecrackerSandbox {
         &mut self,
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
+        if self.launch.common().native_guest_profile.is_some() {
+            bail!("native snapshot is unqualified");
+        }
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
         if self.has_writable_persistent_volumes() {
             let envd = self
@@ -1381,6 +1501,7 @@ impl FirecrackerSandbox {
     ///
     /// Use this when you want to keep the same sandbox instance.
     pub async fn resume(&self) -> Result<()> {
+        self.require_native_launch_unsealed()?;
         debug!("resuming paused sandbox in-place");
         self.fc_instance.resume().await
     }
@@ -1406,18 +1527,43 @@ impl FirecrackerSandbox {
         if let Some(task) = prefetch.as_ref() {
             task.cancel();
         }
-        let vm_stop = self
-            .fc_instance
-            .stop(self.runtime_policy.socket_timeout)
-            .await;
-        if let Err(error) = vm_stop {
-            // If a future Firecracker stop implementation can fail, the VM
-            // may still own its devices. Request reader cleanup, but retain
-            // the sandbox/device handles for a later stop attempt.
-            if let Some(task) = prefetch {
-                task.stop(self.runtime_policy.socket_timeout).await;
+        if self.launch.common().native_guest_profile.is_some() {
+            // Irreversible before the first cleanup await, including failures,
+            // caller cancellation and stop-before-first-start. A claim file is
+            // not the authority for revoking this original object's launch.
+            self.native_stop_started = true;
+            self.native_stop_had_ready_owner |= self.native_ready_observed.get().is_some()
+                && self.native_drive_fds.is_some()
+                && self.native_inputs.is_some()
+                && self.rootfs_runtime.is_none()
+                && self.mem_ublk_device.is_none()
+                && self.extra_drive_runtimes.is_empty();
+            // Both independent owners attempt cleanup even if the other fails.
+            let probe = self.native_probe.retire().await;
+            let vmm = self
+                .fc_instance
+                .stop_native(self.runtime_policy.socket_timeout)
+                .await;
+            match (probe, vmm) {
+                (Ok(()), Ok(())) => {}
+                (probe, vmm) => {
+                    anyhow::bail!("native cleanup incomplete: probe={probe:?}; vmm={vmm:?}")
+                }
             }
-            return Err(error);
+        } else {
+            let vm_stop = self
+                .fc_instance
+                .stop(self.runtime_policy.socket_timeout)
+                .await;
+            if let Err(error) = vm_stop {
+                // If a future Firecracker stop implementation can fail, the VM
+                // may still own its devices. Request reader cleanup, but retain
+                // the sandbox/device handles for a later stop attempt.
+                if let Some(task) = prefetch {
+                    task.stop(self.runtime_policy.socket_timeout).await;
+                }
+                return Err(error);
+            }
         }
 
         // Clear envd instance
@@ -1470,11 +1616,18 @@ impl FirecrackerSandbox {
         let mut network_error = None;
         if let Some(slot) = self.network_slot.take() {
             let idx = slot.idx;
+            if self.launch.common().native_guest_profile.is_some() {
+                self.native_network_release_unknown = true;
+            }
             match NetworkManager::global()
                 .release(slot)
                 .context("Failed to release network slot")
             {
-                Ok(()) => debug!(slot = idx, "network slot released"),
+                Ok(()) => {
+                    self.native_network_release_unknown = false;
+                    self.native_network_returned = true;
+                    debug!(slot = idx, "network slot released");
+                }
                 Err(error) => network_error = Some(error),
             }
         }
@@ -1494,6 +1647,18 @@ impl FirecrackerSandbox {
             return Err(error);
         }
 
+        if self.native_execution_stopped.is_none()
+            && self.native_stop_had_ready_owner
+            && !self.native_network_release_unknown
+        {
+            if let Some(profile) = &self.launch.common().native_guest_profile {
+                self.native_execution_stopped = Some(Arc::new(NativeExecutionStopped {
+                    id: self.id,
+                    profile: profile.clone(),
+                    network_returned: self.native_network_returned,
+                }));
+            }
+        }
         debug!("firecracker sandbox stopped");
         Ok(())
     }
@@ -1715,6 +1880,12 @@ impl Drop for FirecrackerSandbox {
         if let Some(envd) = self.envd_instance.as_ref() {
             envd.invalidate();
         }
+        if self.launch.common().native_guest_profile.is_some() {
+            // TempDir is destroyed before fc_instance. Recursive cleanup would
+            // bypass the latter's original socket/child debt, including foreign
+            // replacements. Native workdir retirement is a separate authority.
+            self.work_dir.disable_cleanup(true);
+        }
         // Fire the best-effort stop notification (fire-and-forget, never
         // blocking drop) before releasing resources.
         self.custom_extension_hook_guard.take();
@@ -1739,9 +1910,49 @@ impl Drop for FirecrackerSandbox {
 // ── Private helpers ──────────────────────────────────────────────────────────
 
 impl FirecrackerSandbox {
+    fn require_native_launch_unsealed(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.launch.common().native_guest_profile.is_none() || !self.native_stop_started,
+            "native original permanently stop-sealed"
+        );
+        Ok(())
+    }
+
+    fn artifacts_with_native(&self, artifacts: RuntimeArtifactSet) -> RuntimeArtifactSet {
+        match &self.native_artifact {
+            Some(native) => artifacts.with_native(native.clone()),
+            None => artifacts,
+        }
+    }
     fn build(id: SandboxId, launch: LaunchMode) -> Result<Self> {
-        let work_dir =
-            create_firecracker_work_dir(launch.common().firecracker_work_base_dir.as_deref())?;
+        Self::build_until(id, launch, None)
+    }
+    fn build_until(
+        id: SandboxId,
+        launch: LaunchMode,
+        expires: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        let native_artifact = launch
+            .common()
+            .native_guest_profile
+            .clone()
+            .map(|profile| match expires {
+                Some(until) => {
+                    super::native_guest::NativeArtifactDescriptor::new_until(profile, until)
+                }
+                None => super::native_guest::NativeArtifactDescriptor::new(profile),
+            })
+            .transpose()?;
+        let mut work_dir = create_firecracker_work_dir(
+            launch.common().firecracker_work_base_dir.as_deref(),
+            native_artifact.is_some(),
+        )?;
+        if native_artifact.is_some() {
+            // Disable before installing any child/resource owner. Never re-enable
+            // merely because socket retirement succeeds: other entries may be
+            // foreign or lack captured cleanup authority.
+            work_dir.disable_cleanup(true);
+        }
         let fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());
         let runtime_policy = launch.common().runtime_policy;
         let current_network_policy = launch.common().network_policy.clone();
@@ -1762,6 +1973,17 @@ impl FirecrackerSandbox {
             current_network_policy,
             current_custom_extension_params,
             envd_instance: None,
+            native_inputs: None,
+            native_artifact,
+            native_probe: super::native_guest::NativeProbeOwner::default(),
+            native_expires: expires,
+            native_drive_fds: None,
+            native_execution_stopped: None,
+            native_stop_had_ready_owner: false,
+            native_stop_started: false,
+            native_ready_observed: std::sync::OnceLock::new(),
+            native_network_release_unknown: false,
+            native_network_returned: false,
             rootfs_runtime: None,
             startup_prefetch_task: None,
             mem_ublk_device: None,
@@ -1779,6 +2001,9 @@ impl FirecrackerSandbox {
 
     #[tracing::instrument(skip(self, config))]
     async fn start_fresh(&mut self, config: FirecrackerSandboxConfig) -> Result<()> {
+        if config.common.native_guest_profile.is_some() {
+            return self.start_native(config).await;
+        }
         let work_dir = self.work_dir.path();
         debug!(work_dir = %work_dir.display(), "starting fresh sandbox");
 
@@ -1956,6 +2181,56 @@ impl FirecrackerSandbox {
             .await?;
         self.fc_instance.start().await?;
         debug!("fresh sandbox started");
+        Ok(())
+    }
+
+    async fn start_native(&mut self, mut config: FirecrackerSandboxConfig) -> Result<()> {
+        self.require_native_launch_unsealed()?;
+        let profile = config
+            .common
+            .native_guest_profile
+            .clone()
+            .context("native profile")?;
+        let inputs = self
+            .native_artifact
+            .as_ref()
+            .context("native typed protection")?
+            .admitted()?;
+        let expiry = self
+            .native_expires
+            .get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(240));
+        anyhow::ensure!(
+            std::time::Instant::now() < *expiry,
+            "native original Worker lease expired before claim"
+        );
+        profile.claim()?;
+        self.native_inputs = Some(inputs);
+        // A slow durable claim cannot renew permission to create the child.
+        self.native_artifact
+            .as_ref()
+            .context("native typed protection")?
+            .admitted()?;
+        let mapping = self
+            .fc_instance
+            .spawn_native(
+                self.native_inputs
+                    .as_ref()
+                    .context("native admitted inputs")?,
+                &profile.vmm_sha256,
+                config.common.stdout_path.as_deref(),
+                config.common.stderr_path.as_deref(),
+            )
+            .await?;
+        config.kernel_image = mapping.kernel();
+        self.native_drive_fds = Some(mapping);
+        self.fc_instance
+            .wait_for_ready(
+                self.runtime_policy.socket_timeout,
+                self.runtime_policy.socket_poll_interval,
+            )
+            .await?;
+        self.configure_microvm(&config, Some("console=ttyS0 reboot=k panic=0 pci=off root=/dev/vda ro init=/init devtmpfs.mount=0"), &[]).await?;
+        self.fc_instance.start().await?;
         Ok(())
     }
 
@@ -2426,17 +2701,29 @@ impl FirecrackerSandbox {
             }
         }
 
-        let kernel_image =
-            fs::canonicalize(&config.kernel_image).unwrap_or_else(|_| config.kernel_image.clone());
+        let kernel_image = if config.common.native_guest_profile.is_some() {
+            config.kernel_image.clone()
+        } else {
+            fs::canonicalize(&config.kernel_image).unwrap_or_else(|_| config.kernel_image.clone())
+        };
         self.fc_instance
             .set_boot_source(&kernel_image, None, boot_args)
             .await?;
 
+        let native_root = self.native_drive_fds.as_ref().map(|fds| fds.rootfs());
+        let native_config = self.native_drive_fds.as_ref().map(|fds| fds.config());
+        if config.common.native_guest_profile.is_some()
+            && (native_root.is_none() || native_config.is_none())
+        {
+            bail!("native child descriptor mapping absent");
+        }
         // Drive 0 (/dev/vda): tools drive as root device, always read-only.
         self.fc_instance
             .add_drive(
                 ROOTFS_DRIVE_ID,
-                Path::new(ROOTFS_DRIVE_PATH),
+                native_root
+                    .as_deref()
+                    .unwrap_or(Path::new(ROOTFS_DRIVE_PATH)),
                 true,
                 true,
                 false,
@@ -2457,14 +2744,30 @@ impl FirecrackerSandbox {
         self.fc_instance
             .add_drive(
                 USER_ROOTFS_DRIVE_ID,
-                Path::new(USER_ROOTFS_DRIVE_PATH),
+                native_config
+                    .as_deref()
+                    .unwrap_or(Path::new(USER_ROOTFS_DRIVE_PATH)),
                 false,
-                false,
-                true,
-                IoEngine::Async,
-                build_disk_rate_limiter(&config.common.disk_rate_limit)?,
+                config.common.native_guest_profile.is_some(),
+                config.common.native_guest_profile.is_none(),
+                if config.common.native_guest_profile.is_some() {
+                    IoEngine::Sync
+                } else {
+                    IoEngine::Async
+                },
+                if config.common.native_guest_profile.is_some() {
+                    None
+                } else {
+                    build_disk_rate_limiter(&config.common.disk_rate_limit)?
+                },
             )
             .await?;
+
+        if let Some(profile) = &config.common.native_guest_profile {
+            self.fc_instance
+                .add_vsock(profile.guest_cid, Path::new("native-guest.vsock"))
+                .await?;
+        }
 
         // Drive 2+ (/dev/vdc...): physical extra drives followed by volume slots.
         // Firecracker cannot add a virtio-block device after snapshot restore,
@@ -3095,6 +3398,174 @@ mod tests {
         assert_eq!(common.physical_extra_drive_count, 1);
         assert!(common.volume_drive_slots >= 1);
         assert_eq!(common.extra_drives, vec![physical_drive, volume_drive]);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires explicit protected unclaimed root native profile; retains own workdir/sentinel/socket debt, no VM or claim"]
+    async fn native_enclosing_sandbox_drop_preserves_socket_and_foreign_sentinel() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixListener;
+        let home =
+            PathBuf::from(std::env::var_os("AENV_HOME_PATH").context("explicit protected home")?);
+        let home_pin = fs::symlink_metadata(&home)?;
+        anyhow::ensure!(
+            home_pin.is_dir()
+                && home_pin.uid() == 0
+                && home_pin.gid() == 0
+                && home_pin.mode() & 0o7777 == 0o700,
+            "protected root fixture required"
+        );
+        let profile_path = PathBuf::from(
+            std::env::var_os("AGENTENV_NATIVE_ARTIFACT_PROFILE")
+                .context("explicit profile required")?,
+        );
+        let expected = std::env::var("AGENTENV_NATIVE_ARTIFACT_PROFILE_SHA256")?;
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        anyhow::ensure!(
+            expected.len() == 64
+                && expected
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "profile expected SHA shape"
+        );
+        let control = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&profile_path)?;
+        let pin = control.metadata()?;
+        anyhow::ensure!(
+            pin.is_file()
+                && pin.uid() == 0
+                && pin.gid() == 0
+                && pin.nlink() == 1
+                && pin.mode() & 0o7777 == 0o600
+                && pin.len() <= 16384,
+            "protected regular profile required"
+        );
+        let version = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.mode(),
+                m.uid(),
+                m.gid(),
+                m.nlink(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        let original_version = version(&pin);
+        let verify = || -> Result<()> {
+            anyhow::ensure!(
+                std::time::Instant::now() < until
+                    && version(&control.metadata()?) == original_version
+                    && version(&fs::symlink_metadata(&profile_path)?) == original_version,
+                "profile original version/deadline"
+            );
+            Ok(())
+        };
+        verify()?;
+        let mut digest = Sha256::new();
+        let mut offset = 0u64;
+        let mut bytes = [0u8; 4096];
+        while offset < pin.len() {
+            verify()?;
+            let want = (pin.len() - offset).min(bytes.len() as u64) as usize;
+            let got = control.read_at(&mut bytes[..want], offset)?;
+            anyhow::ensure!(got > 0, "profile short read");
+            digest.update(&bytes[..got]);
+            offset += got as u64;
+            verify()?;
+        }
+        anyhow::ensure!(
+            control.read_at(&mut bytes[..1], offset)? == 0
+                && format!("{:x}", digest.finalize()) == expected,
+            "profile exact EOF/SHA"
+        );
+        verify()?;
+        let profile = super::super::native_guest::NativeGuestProfile::load(&profile_path)?;
+        verify()?;
+        let claim = profile
+            .config_path
+            .parent()
+            .context("profile config parent")?
+            .join("agentenv-attempted");
+        anyhow::ensure!(
+            matches!(fs::symlink_metadata(&claim), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+            "unclaimed profile required"
+        );
+        // Construct the genuine enclosing backend without starting, importing,
+        // claiming or modifying the profile; descriptor provenance is real.
+        let mut config = fresh_config();
+        config.common.firecracker_work_base_dir = Some(home.clone());
+        config.common.native_guest_profile = Some(profile);
+        let mut sandbox = FirecrackerSandbox::new(config)?;
+        // Actual enclosing native stop before any launch: no injected receipt,
+        // child or profile mutation. All subsequent entry points must refuse.
+        sandbox.stop().await?;
+        let sealed = sandbox.native_stop_started
+            && sandbox.native_execution_stopped.is_none()
+            && sandbox.start_nowait().await.is_err()
+            && sandbox.wait_for_ready().await.is_err()
+            && sandbox.resume().await.is_err()
+            && matches!(fs::symlink_metadata(&claim), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound);
+        let native_path = sandbox.work_dir.path().to_owned();
+        let sentinel_path = native_path.join("foreign-sentinel");
+        fs::write(&sentinel_path, b"foreign fixture sentinel")?;
+        let socket_path = native_path.join("firecracker.socket");
+        let socket = UnixListener::bind(&socket_path)?;
+        let original = fs::symlink_metadata(&socket_path)?;
+        drop(sandbox);
+        let preserved = (|| -> Result<bool> {
+            let named = fs::symlink_metadata(&socket_path)?;
+            Ok(named.dev() == original.dev()
+                && named.ino() == original.ino()
+                && named.mode() == original.mode()
+                && named.nlink() == original.nlink()
+                && named.mtime() == original.mtime()
+                && named.mtime_nsec() == original.mtime_nsec()
+                && named.ctime() == original.ctime()
+                && named.ctime_nsec() == original.ctime_nsec()
+                && fs::read(&sentinel_path)? == b"foreign fixture sentinel")
+        })();
+        drop(socket);
+        // Native entries deliberately remain; the test cannot authorize their
+        // recursive retirement. Legacy cleanup remains exercised separately.
+        let mut legacy = fresh_config();
+        legacy.common.firecracker_work_base_dir = Some(home);
+        let legacy = FirecrackerSandbox::new(legacy)?;
+        let legacy_path = legacy.work_dir.path().to_owned();
+        fs::write(legacy_path.join("legacy-owned"), b"legacy")?;
+        drop(legacy);
+        anyhow::ensure!(
+            sealed && preserved? && native_path.is_dir() && !legacy_path.exists(),
+            "enclosing workdir custody changed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generic_successful_stop_cannot_mint_native_execution_evidence() -> Result<()> {
+        let mut backend = crate::sandbox::mock::MockSandboxBackend::new(Arc::new(
+            crate::sandbox::mock::MockBehavior::default(),
+        ));
+        crate::sandbox::SandboxBackend::stop(&mut backend).await?;
+        anyhow::ensure!(
+            crate::sandbox::SandboxBackend::native_execution_stopped(&backend).is_none(),
+            "generic stop minted native producer capability"
+        );
+        let sandbox = FirecrackerSandbox::new(fresh_config())?;
+        anyhow::ensure!(
+            crate::sandbox::SandboxBackend::native_execution_stopped(&sandbox).is_none(),
+            "unstarted backend minted native producer capability"
+        );
         Ok(())
     }
 

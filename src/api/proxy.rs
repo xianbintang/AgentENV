@@ -76,6 +76,7 @@ enum ProxyRequestError {
     AutoResumeFailed(SandboxId),
     AutoResumeTimedOut(SandboxId),
     MissingRuntimeRoute(SandboxId),
+    NativeControlOnly(SandboxId),
     InvalidUpstreamUri,
     InternalServerError,
 }
@@ -164,6 +165,9 @@ pub(crate) fn route_for_auth(request: &Request, domains: &[String]) -> Option<(S
 
 pub(crate) fn is_sandbox_proxy_request(request: &Request, domains: &[String]) -> bool {
     let path = request.uri().path();
+    if crate::api::native_control::is_native_route(path) {
+        return false;
+    }
     if has_proxy_prefix(path) {
         return true;
     }
@@ -199,6 +203,9 @@ where
     I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
 {
     let path = request.uri().path();
+    if crate::api::native_control::is_native_route(path) {
+        return next.run(request).await;
+    }
     if has_proxy_prefix(path) {
         return next.run(request).await;
     }
@@ -722,8 +729,11 @@ async fn resolve_proxy_request(
     let target = loop {
         match api_impl.orchestrator().proxy_lookup_for(&sandbox_id).await {
             Ok(ProxyLookupResult::Ready(target)) => break target,
+            Ok(ProxyLookupResult::NativeControl) => {
+                return Err(ProxyRequestError::NativeControlOnly(sandbox_id));
+            }
             Ok(ProxyLookupResult::NotFound) => {
-                return Err(ProxyRequestError::SandboxNotFound(sandbox_id))
+                return Err(ProxyRequestError::SandboxNotFound(sandbox_id));
             }
             Ok(ProxyLookupResult::Paused { auto_resume: true }) => {
                 if auto_resume_attempted {
@@ -737,21 +747,21 @@ async fn resolve_proxy_request(
                 return Err(ProxyRequestError::SandboxUnavailable(
                     sandbox_id,
                     SandboxState::Paused,
-                ))
+                ));
             }
             Ok(ProxyLookupResult::Unavailable(_)) | Ok(ProxyLookupResult::RouteMissing)
                 if auto_resume_attempted =>
             {
-                return Err(ProxyRequestError::AutoResumeFailed(sandbox_id))
+                return Err(ProxyRequestError::AutoResumeFailed(sandbox_id));
             }
             Ok(ProxyLookupResult::Unavailable(state)) => {
-                return Err(ProxyRequestError::SandboxUnavailable(sandbox_id, state))
+                return Err(ProxyRequestError::SandboxUnavailable(sandbox_id, state));
             }
             Ok(ProxyLookupResult::RouteMissing) => {
-                return Err(ProxyRequestError::MissingRuntimeRoute(sandbox_id))
+                return Err(ProxyRequestError::MissingRuntimeRoute(sandbox_id));
             }
             Err(OrchestratorError::SandboxNotFound(_)) => {
-                return Err(ProxyRequestError::SandboxNotFound(sandbox_id))
+                return Err(ProxyRequestError::SandboxNotFound(sandbox_id));
             }
             Err(err) if auto_resume_attempted => {
                 warn!(
@@ -868,6 +878,10 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
             StatusCode::BAD_GATEWAY,
             "sandbox route is temporarily unavailable",
         ),
+        ProxyRequestError::NativeControlOnly(_) => (
+            StatusCode::NOT_IMPLEMENTED,
+            "sandbox supports native execution without an HTTP proxy",
+        ),
         ProxyRequestError::InvalidUpstreamUri => {
             (StatusCode::BAD_REQUEST, "failed to construct upstream URI")
         }
@@ -901,6 +915,9 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
         }
         ProxyRequestError::MissingRuntimeRoute(sandbox_id) => {
             warn!(sandbox_id = %sandbox_id, status = %status, message, "sandbox route missing for running sandbox")
+        }
+        ProxyRequestError::NativeControlOnly(sandbox_id) => {
+            debug!(sandbox_id = %sandbox_id, status = %status, "HTTP proxy unsupported for native execution sandbox");
         }
         ProxyRequestError::InternalServerError => unreachable!("handled above"),
     }
@@ -1200,7 +1217,7 @@ fn tungstenite_message_to_axum(message: TungsteniteMessage) -> Option<WebSocketM
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{
         convert::Infallible,
@@ -1713,18 +1730,42 @@ mod tests {
         build_api_with_auth(domains, TEST_API_KEY).await
     }
 
-    async fn build_api_with_auth(domains: Vec<String>, api_key: &str) -> Arc<ApiImpl> {
+    pub(crate) async fn build_api_with_auth(domains: Vec<String>, api_key: &str) -> Arc<ApiImpl> {
+        build_api_fixture(domains, api_key, false).await.0
+    }
+    pub(crate) async fn build_api_with_auth_retained(
+        domains: Vec<String>,
+        api_key: &str,
+    ) -> (Arc<ApiImpl>, tempfile::TempDir) {
+        build_api_fixture(domains, api_key, true).await
+    }
+    async fn build_api_fixture(
+        domains: Vec<String>,
+        api_key: &str,
+        native_pipe: bool,
+    ) -> (Arc<ApiImpl>, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
-        let orchestrator = Orchestrator::new(
-            crate::orchestrator::InMemoryMetadataStore::new(),
-            crate::sandbox::FirecrackerSandboxFactory::new(),
-            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
-        )
-        .await
+        let store = crate::orchestrator::InMemoryMetadataStore::new();
+        let factory = crate::sandbox::FirecrackerSandboxFactory::new();
+        let persister = FileBackedSandboxPersister::new_for_test(root.path().to_path_buf());
+        let orchestrator = if native_pipe {
+            Orchestrator::new_native_api_fixture(store, factory, persister).await
+        } else {
+            Orchestrator::new_native_qualification_fixture(
+                store,
+                factory,
+                persister,
+                crate::image::cache::test_support::owned_real_image_services().runtime_refs,
+            )
+            .await
+        }
         .unwrap();
         let snapshot_manager = Arc::new(mock_snapshot_manager());
         let template_builder = Arc::new(TemplateBuilder::new());
-        let image_resolver = Arc::new(ImageResolver::new(&AppConfig::default()));
+        let image_resolver = Arc::new(ImageResolver::with_store(
+            &AppConfig::default(),
+            crate::image::cache::test_support::owned_real_image_services().source_images,
+        ));
         let volume_manager = Arc::new(
             crate::volume::VolumeManager::open_with_repository(
                 root.path().join("volumes/catalog.json"),
@@ -1733,16 +1774,19 @@ mod tests {
             .await
             .unwrap(),
         );
-        Arc::new(ApiImpl::new(
-            orchestrator,
-            snapshot_manager,
-            template_builder,
-            image_resolver,
-            volume_manager,
-            None,
-            domains,
-            ApiKey::new(api_key).unwrap(),
-        ))
+        (
+            Arc::new(ApiImpl::new(
+                orchestrator,
+                snapshot_manager,
+                template_builder,
+                image_resolver,
+                volume_manager,
+                None,
+                domains,
+                ApiKey::new(api_key).unwrap(),
+            )),
+            root,
+        )
     }
 
     async fn proxy_app_for_sandbox_with_state_and_auto_resume(

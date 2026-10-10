@@ -1,5 +1,6 @@
 //! Node-local image storage ports used outside the image cache module.
 
+use futures::future::BoxFuture;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,31 +35,60 @@ pub(crate) enum OverlaybdLayerLocation {
 pub(crate) enum RuntimeImageOwner {
     StartingSandbox(SandboxId),
     PausedSandbox(SandboxId),
+    NativeFailedLaunchDebt {
+        debt: SandboxId,
+        original: SandboxId,
+    },
 }
 
 #[async_trait]
 pub(crate) trait SourceImageStore: Send + Sync + std::fmt::Debug {
-    async fn open(
-        &self,
-        manifest_digest: &str,
-        repository_scope: Option<&str>,
-    ) -> Result<Box<dyn SourceImageEntry>>;
+    fn open<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        manifest_digest: &'life1 str,
+        repository_scope: Option<&'life2 str>,
+    ) -> BoxFuture<'async_trait, Result<Box<dyn SourceImageEntry>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait;
 }
 
 #[async_trait]
 pub(crate) trait SourceImageEntry: Send {
-    async fn cached_config(&self) -> Result<CachedImageConfig>;
+    fn cached_config<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> BoxFuture<'async_trait, Result<CachedImageConfig>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
-    async fn begin_conversion(&self) -> Result<Box<dyn ImageConversion>>;
+    fn begin_conversion<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> BoxFuture<'async_trait, Result<Box<dyn ImageConversion>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
-    async fn publish_config(
-        &self,
-        overlaybd_config: &Value,
+    fn publish_config<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        overlaybd_config: &'life1 Value,
         metadata: ImageResolutionMetadata,
         conversion: Box<dyn ImageConversion>,
-    ) -> Result<PathBuf>;
+    ) -> BoxFuture<'async_trait, Result<PathBuf>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
-    async fn write_metadata(&self, metadata: ImageResolutionMetadata) -> Result<PathBuf>;
+    fn write_metadata<'life0, 'async_trait>(
+        &'life0 self,
+        metadata: ImageResolutionMetadata,
+    ) -> BoxFuture<'async_trait, Result<PathBuf>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 }
 
 pub(crate) trait OverlaybdLayerStore: Send + Sync + std::fmt::Debug {
@@ -69,13 +99,76 @@ pub(crate) trait OverlaybdLayerStore: Send + Sync + std::fmt::Debug {
 
 #[async_trait]
 pub(crate) trait RuntimeImageRefs: Send + Sync + std::fmt::Debug {
-    async fn pin(&self, owner: RuntimeImageOwner, artifacts: RuntimeArtifactSet) -> Result<()>;
+    fn pin<'life0, 'async_trait>(
+        &'life0 self,
+        owner: RuntimeImageOwner,
+        artifacts: RuntimeArtifactSet,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
-    async fn unpin_best_effort(&self, owner: RuntimeImageOwner);
+    fn promote_native_running<'life0, 'async_trait>(
+        &'life0 self,
+        _id: SandboxId,
+        artifacts: RuntimeArtifactSet,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let (_, native) = artifacts.split();
+            anyhow::ensure!(
+                native.is_empty(),
+                "runtime refs do not admit native custody"
+            );
+            Ok(())
+        })
+    }
+    fn retire_native_running<'life0, 'async_trait>(
+        &'life0 self,
+        _id: SandboxId,
+        artifacts: RuntimeArtifactSet,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let (_, native) = artifacts.split();
+            anyhow::ensure!(
+                native.is_empty(),
+                "runtime refs do not own native retirement"
+            );
+            Ok(())
+        })
+    }
 
-    async fn reconcile_paused(&self, live_paused: &[SandboxId]) -> Result<()>;
+    fn unpin_best_effort<'life0, 'async_trait>(
+        &'life0 self,
+        owner: RuntimeImageOwner,
+    ) -> BoxFuture<'async_trait, ()>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
-    async fn maintain_running(&self, running: Vec<(SandboxId, RuntimeArtifactSet)>) -> Result<()>;
+    fn reconcile_paused<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        live_paused: &'life1 [SandboxId],
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
+
+    fn maintain_running<'life0, 'async_trait>(
+        &'life0 self,
+        running: Vec<(SandboxId, RuntimeArtifactSet)>,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 }
 
 #[derive(Clone)]
@@ -90,6 +183,7 @@ struct ImageCacheStore {
     cache: Arc<ImageCacheService>,
     gc_watermark: Option<(u64, u64)>,
     gc_min_age: Duration,
+    native: Arc<super::native_artifact_store::NativeArtifactStore>,
 }
 
 struct ImageCacheSourceImageEntry {
@@ -169,17 +263,35 @@ impl OverlaybdLayerStore for ImageCacheStore {
 #[async_trait]
 impl RuntimeImageRefs for ImageCacheStore {
     async fn pin(&self, owner: RuntimeImageOwner, artifacts: RuntimeArtifactSet) -> Result<()> {
+        let (paths, native) = artifacts.split();
+        self.native.pin(owner.clone(), native).await?;
+        if paths.is_empty() {
+            return Ok(());
+        }
         let (namespace, id) = owner_namespace(owner);
-        self.cache
-            .protect(
-                namespace,
-                &id.to_string(),
-                artifacts.into_overlaybd_image_config_paths(),
-            )
-            .await
+        self.cache.protect(namespace, &id.to_string(), paths).await
+    }
+
+    async fn promote_native_running(
+        &self,
+        id: SandboxId,
+        artifacts: RuntimeArtifactSet,
+    ) -> Result<()> {
+        let (_, native) = artifacts.split();
+        self.native.promote(id, native)
+    }
+
+    async fn retire_native_running(
+        &self,
+        id: SandboxId,
+        artifacts: RuntimeArtifactSet,
+    ) -> Result<()> {
+        let (_, native) = artifacts.split();
+        self.native.retire_running(id, native)
     }
 
     async fn unpin_best_effort(&self, owner: RuntimeImageOwner) {
+        self.native.release(&owner);
         let (namespace, id) = owner_namespace(owner);
         self.cache
             .release_protection_best_effort(namespace, &id.to_string())
@@ -194,16 +306,15 @@ impl RuntimeImageRefs for ImageCacheStore {
     }
 
     async fn maintain_running(&self, running: Vec<(SandboxId, RuntimeArtifactSet)>) -> Result<()> {
-        let running = running
-            .into_iter()
-            .filter(|(_, artifacts)| !artifacts.is_empty())
-            .map(|(id, artifacts)| {
-                (
-                    id.to_string(),
-                    artifacts.into_overlaybd_image_config_paths(),
-                )
-            })
-            .collect();
+        let mut overlaybd = Vec::new();
+        for (id, artifacts) in running {
+            let (paths, native) = artifacts.split();
+            self.native.promote(id, native)?;
+            if !paths.is_empty() {
+                overlaybd.push((id.to_string(), paths));
+            }
+        }
+        let running = overlaybd;
         let summary = self
             .cache
             .run_maintenance(running, self.gc_watermark, self.gc_min_age)
@@ -222,6 +333,7 @@ fn owner_namespace(owner: RuntimeImageOwner) -> (HoldNamespace, SandboxId) {
     match owner {
         RuntimeImageOwner::StartingSandbox(id) => (HoldNamespace::Runtime, id),
         RuntimeImageOwner::PausedSandbox(id) => (HoldNamespace::Paused, id),
+        RuntimeImageOwner::NativeFailedLaunchDebt { debt, .. } => (HoldNamespace::Runtime, debt),
     }
 }
 
@@ -233,6 +345,7 @@ pub(crate) fn local_image_services_from_app_config(config: &AppConfig) -> LocalI
         cache,
         gc_watermark: gc.watermark_bytes(capacity_bytes),
         gc_min_age: gc.min_age,
+        native: super::native_artifact_store::NativeArtifactStore::shared(),
     }))
 }
 
@@ -258,5 +371,6 @@ pub(crate) fn test_local_image_services_from_service(
         cache,
         gc_watermark,
         gc_min_age,
+        native: Arc::new(super::native_artifact_store::NativeArtifactStore::default()),
     }))
 }

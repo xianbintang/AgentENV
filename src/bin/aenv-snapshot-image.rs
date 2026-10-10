@@ -29,7 +29,7 @@ struct Cli {
     target_repository: Option<String>,
 
     /// OCI image tag. Defaults to latest for an explicit target, or
-    /// snapshot-<snapshot-id> when the target repository is inferred.
+    /// `snapshot-<snapshot-id>` when the target repository is inferred.
     #[arg(long)]
     tag: Option<String>,
 

@@ -40,7 +40,7 @@ pub(crate) fn prepare_runtime(runtime_path: &Path) -> anyhow::Result<()> {
                 Err(error) => {
                     return Err(error).with_context(|| {
                         format!("unmount stale AENV network namespace {}", path.display())
-                    })
+                    });
                 }
             }
         }

@@ -198,28 +198,44 @@ pub trait Templates<E: std::fmt::Debug + Send + Sync + 'static = ()>:
     /// Check template alias.
     ///
     /// TemplatesAliasesAliasGet - GET /templates/aliases/{alias}
-    async fn templates_aliases_alias_get(
-        &self,
+    fn templates_aliases_alias_get<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::TemplatesAliasesAliasGetPathParams,
-    ) -> Result<TemplatesAliasesAliasGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::TemplatesAliasesAliasGetPathParams,
+    ) -> super::ApiFuture<'async_trait, Result<TemplatesAliasesAliasGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 
     /// List templates.
     ///
     /// TemplatesGet - GET /templates
-    async fn templates_get(
-        &self,
+    fn templates_get<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        query_params: &models::TemplatesGetQueryParams,
-    ) -> Result<TemplatesGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        query_params: &'life5 models::TemplatesGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<TemplatesGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 
     /// Cancel a template build and release its worker.
     ///
@@ -265,81 +281,159 @@ pub trait Templates<E: std::fmt::Debug + Send + Sync + 'static = ()>:
     /// Template build status.
     ///
     /// TemplatesTemplateIdBuildsBuildIdStatusGet - GET /templates/{templateID}/builds/{buildID}/status
-    async fn templates_template_id_builds_build_id_status_get(
-        &self,
+    fn templates_template_id_builds_build_id_status_get<
+        'life0,
+        'life1,
+        'life2,
+        'life3,
+        'life4,
+        'life5,
+        'life6,
+        'async_trait,
+    >(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::TemplatesTemplateIdBuildsBuildIdStatusGetPathParams,
-        query_params: &models::TemplatesTemplateIdBuildsBuildIdStatusGetQueryParams,
-    ) -> Result<TemplatesTemplateIdBuildsBuildIdStatusGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::TemplatesTemplateIdBuildsBuildIdStatusGetPathParams,
+        query_params: &'life6 models::TemplatesTemplateIdBuildsBuildIdStatusGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<TemplatesTemplateIdBuildsBuildIdStatusGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        'life6: 'async_trait,
+        Self: 'async_trait;
 
     /// Delete template.
     ///
     /// TemplatesTemplateIdDelete - DELETE /templates/{templateID}
-    async fn templates_template_id_delete(
-        &self,
+    fn templates_template_id_delete<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::TemplatesTemplateIdDeletePathParams,
-    ) -> Result<TemplatesTemplateIdDeleteResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::TemplatesTemplateIdDeletePathParams,
+    ) -> super::ApiFuture<'async_trait, Result<TemplatesTemplateIdDeleteResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 
     /// List template builds.
     ///
     /// TemplatesTemplateIdGet - GET /templates/{templateID}
-    async fn templates_template_id_get(
-        &self,
+    fn templates_template_id_get<
+        'life0,
+        'life1,
+        'life2,
+        'life3,
+        'life4,
+        'life5,
+        'life6,
+        'async_trait,
+    >(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::TemplatesTemplateIdGetPathParams,
-        query_params: &models::TemplatesTemplateIdGetQueryParams,
-    ) -> Result<TemplatesTemplateIdGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::TemplatesTemplateIdGetPathParams,
+        query_params: &'life6 models::TemplatesTemplateIdGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<TemplatesTemplateIdGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        'life6: 'async_trait,
+        Self: 'async_trait;
 
     /// List templates (v2).
     ///
     /// V2TemplatesGet - GET /v2/templates
-    async fn v2_templates_get(
-        &self,
+    fn v2_templates_get<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        query_params: &models::V2TemplatesGetQueryParams,
-    ) -> Result<V2TemplatesGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        query_params: &'life5 models::V2TemplatesGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<V2TemplatesGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 
     /// Start template build (v2).
     ///
     /// V2TemplatesTemplateIdBuildsBuildIdPost - POST /v2/templates/{templateID}/builds/{buildID}
-    async fn v2_templates_template_id_builds_build_id_post(
-        &self,
+    fn v2_templates_template_id_builds_build_id_post<
+        'life0,
+        'life1,
+        'life2,
+        'life3,
+        'life4,
+        'life5,
+        'life6,
+        'async_trait,
+    >(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::V2TemplatesTemplateIdBuildsBuildIdPostPathParams,
-        body: &models::TemplateBuildStartV2,
-    ) -> Result<V2TemplatesTemplateIdBuildsBuildIdPostResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::V2TemplatesTemplateIdBuildsBuildIdPostPathParams,
+        body: &'life6 models::TemplateBuildStartV2,
+    ) -> super::ApiFuture<'async_trait, Result<V2TemplatesTemplateIdBuildsBuildIdPostResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        'life6: 'async_trait,
+        Self: 'async_trait;
 
     /// Create template (v3).
     ///
     /// V3TemplatesPost - POST /v3/templates
-    async fn v3_templates_post(
-        &self,
+    fn v3_templates_post<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        body: &models::TemplateBuildRequestV3,
-    ) -> Result<V3TemplatesPostResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        body: &'life5 models::TemplateBuildRequestV3,
+    ) -> super::ApiFuture<'async_trait, Result<V3TemplatesPostResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 }

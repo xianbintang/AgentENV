@@ -67,7 +67,13 @@ pub struct ImageResolver {
 
 impl ImageResolver {
     pub fn new(config: &AppConfig) -> Self {
-        let store = local_image_services_from_app_config(config).source_images;
+        Self::with_store(
+            config,
+            local_image_services_from_app_config(config).source_images,
+        )
+    }
+
+    pub(crate) fn with_store(config: &AppConfig, store: Arc<dyn SourceImageStore>) -> Self {
         Self {
             store,
             overlaybd_install_root: config.deps_path.join("overlaybd"),
@@ -613,7 +619,10 @@ mod tests {
             ..AppConfig::default()
         };
         ImageConfig::normalize(&mut config.image, temp.path(), temp.path());
-        ImageResolver::new(&config)
+        ImageResolver::with_store(
+            &config,
+            crate::image::cache::test_support::owned_real_image_services().source_images,
+        )
     }
 
     #[test]
@@ -729,7 +738,10 @@ mod tests {
             ..AppConfig::default()
         };
         ImageConfig::normalize(&mut config.image, temp.path(), temp.path());
-        let resolver = ImageResolver::new(&config);
+        let resolver = ImageResolver::with_store(
+            &config,
+            crate::image::cache::test_support::owned_real_image_services().source_images,
+        );
 
         assert_eq!(resolver.default_image(), "ghcr.io/example/base:latest");
     }

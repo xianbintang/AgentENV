@@ -416,12 +416,16 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager) {
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.join("repository"),
-            cache_root: Some(root.join("runtime-cache")),
-            runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
+        let backend = PosixFsBackend::from_parts(
+            PosixFsBackendConfig {
+                root: root.join("repository"),
+                cache_root: Some(root.join("runtime-cache")),
+                runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+            },
+            crate::image::cache::test_support::owned_real_image_services().overlaybd_layers,
+            crate::snapshot::LocalArtifactCache::new(root.join("runtime-cache"), None)
+                .expect("artifact cache"),
+        );
         let (repository, runtime_resolver) = backend.into_parts();
         let snapshot_manager =
             SnapshotManager::from_parts(repository.clone(), runtime_resolver.clone(), None);

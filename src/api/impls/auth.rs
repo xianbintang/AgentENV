@@ -49,6 +49,23 @@ pub(crate) async fn require_auth<I>(
 where
     I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
 {
+    if crate::api::native_control::is_native_route(request.uri().path()) {
+        let api = api_impl.as_ref();
+        if !api.has_valid_api_key(request.headers()) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(
+            single_header(request.headers(), API_KEY_HEADER)
+                .expect("validated single API key")
+                .as_bytes(),
+        )
+        .into();
+        request
+            .extensions_mut()
+            .insert(crate::api::native_control::CallerDigest(digest));
+        return next.run(request).await;
+    }
     let proxy_request =
         proxy::is_sandbox_proxy_request(&request, api_impl.as_ref().sandbox_proxy_domains());
     if matches!(request.uri().path(), "/health" | "/metrics") && !proxy_request {

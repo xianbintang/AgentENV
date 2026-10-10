@@ -1,5 +1,6 @@
 mod scheduler;
 
+use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
@@ -13,22 +14,56 @@ pub use scheduler::SchedulerPeerDiscovery;
 /// Source of candidate peers for artifact lookup.
 pub trait P2pPeerDiscovery: Send + Sync {
     /// Return currently known peers that may serve artifact catalog requests.
-    async fn peers(&self) -> Result<Vec<P2pPeer>>;
+    fn peers<'life0, 'async_trait>(&'life0 self) -> BoxFuture<'async_trait, Result<Vec<P2pPeer>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Return candidate peers with caller-provided hints prioritized ahead of discovery results.
-    async fn peers_with_hints(&self, hints: &[P2pArtifactProviderHint]) -> Result<Vec<P2pPeer>> {
-        let discovered = self.peers().await?;
-        Ok(merge_hints_with_discovered_peers(hints, discovered))
+    fn peers_with_hints<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        hints: &'life1 [P2pArtifactProviderHint],
+    ) -> BoxFuture<'async_trait, Result<Vec<P2pPeer>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let discovered = self.peers().await?;
+            Ok(merge_hints_with_discovered_peers(hints, discovered))
+        })
     }
 
     /// Return peers scheduler has indexed for a specific artifact key.
-    async fn peers_for_key(&self, _key: &P2pArtifactKey) -> Result<Vec<P2pPeer>>;
+    fn peers_for_key<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _key: &'life1 P2pArtifactKey,
+    ) -> BoxFuture<'async_trait, Result<Vec<P2pPeer>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Best-effort notification that this node can serve `key`.
-    async fn record_key(&self, _key: &P2pArtifactKey) -> Result<()>;
+    fn record_key<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _key: &'life1 P2pArtifactKey,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Best-effort notification that this node no longer serves `key`.
-    async fn forget_key(&self, _key: &P2pArtifactKey) -> Result<()>;
+    fn forget_key<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _key: &'life1 P2pArtifactKey,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 }
 
 #[derive(Debug, Default)]

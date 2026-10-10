@@ -5,6 +5,7 @@
 //! instances (from scratch, from a committed snapshot, or from paused state).
 
 use super::manifest::SandboxSnapshotManifest;
+use futures::future::{BoxFuture, LocalBoxFuture};
 use std::any::Any;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -100,10 +101,26 @@ pub struct SandboxForkSpec {
 /// Sandbox backends construct this from their runtime config, the orchestrator
 /// carries it across lifecycle boundaries, and the image-liveness layer decides
 /// how to protect the concrete local artifacts.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) type NativeArtifactHandles =
+    Vec<Arc<super::firecracker::native_guest::NativeArtifactDescriptor>>;
+#[derive(Clone, Debug, Default)]
 pub struct RuntimeArtifactSet {
     overlaybd_image_config_paths: Vec<PathBuf>,
+    native: NativeArtifactHandles,
 }
+
+impl PartialEq for RuntimeArtifactSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.overlaybd_image_config_paths == other.overlaybd_image_config_paths
+            && self.native.len() == other.native.len()
+            && self
+                .native
+                .iter()
+                .zip(&other.native)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+    }
+}
+impl Eq for RuntimeArtifactSet {}
 
 impl RuntimeArtifactSet {
     /// No local runtime artifacts.
@@ -116,15 +133,39 @@ impl RuntimeArtifactSet {
     pub(crate) fn from_overlaybd_image_configs(overlaybd_image_config_paths: Vec<PathBuf>) -> Self {
         Self {
             overlaybd_image_config_paths,
+            native: Vec::new(),
         }
     }
 
+    pub(crate) fn has_native(&self) -> bool {
+        !self.native.is_empty()
+    }
     pub fn is_empty(&self) -> bool {
-        self.overlaybd_image_config_paths.is_empty()
+        self.overlaybd_image_config_paths.is_empty() && self.native.is_empty()
     }
 
-    pub(crate) fn into_overlaybd_image_config_paths(self) -> Vec<PathBuf> {
-        self.overlaybd_image_config_paths
+    pub(crate) fn with_native(
+        mut self,
+        native: Arc<super::firecracker::native_guest::NativeArtifactDescriptor>,
+    ) -> Self {
+        self.native.push(native);
+        self
+    }
+    pub(crate) fn split(self) -> (Vec<PathBuf>, NativeArtifactHandles) {
+        (self.overlaybd_image_config_paths, self.native)
+    }
+    pub(crate) fn union(mut self, other: Self) -> Self {
+        for path in other.overlaybd_image_config_paths {
+            if !self.overlaybd_image_config_paths.contains(&path) {
+                self.overlaybd_image_config_paths.push(path);
+            }
+        }
+        for original in other.native {
+            if !self.native.iter().any(|v| Arc::ptr_eq(v, &original)) {
+                self.native.push(original);
+            }
+        }
+        self
     }
 }
 
@@ -214,16 +255,25 @@ pub trait SandboxBackend: Send + 'static {
     }
 
     /// Start the sandbox and block until readiness.
-    async fn start(&mut self) -> Result<()>;
+    fn start<'life0, 'async_trait>(&'life0 mut self) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Start the sandbox without waiting for the sandbox to become ready.
-    async fn start_nowait(&mut self) -> Result<()>;
+    fn start_nowait<'life0, 'async_trait>(&'life0 mut self) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Block until the sandbox signals readiness.
     ///
     /// Should be called after [`start_nowait`][Self::start_nowait] before any
     /// workload is submitted.
-    async fn wait_for_ready(&self) -> Result<()>;
+    fn wait_for_ready<'life0, 'async_trait>(&'life0 self) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Pause the sandbox and capture its state for later resume.
     ///
@@ -238,15 +288,22 @@ pub trait SandboxBackend: Send + 'static {
     ///
     /// For simplicity, [`SandboxCaptureError::Recoverable`] must guarantee the sandbox
     /// has already been restored to a running state before the error is returned.
-    async fn pause(
-        &mut self,
-        artifact_root: Option<&Path>,
-    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>>;
+    fn pause<'life0, 'life1, 'async_trait>(
+        &'life0 mut self,
+        artifact_root: Option<&'life1 Path>,
+    ) -> BoxFuture<'async_trait, SandboxCaptureResult<Arc<dyn PausedSandboxState>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Resume a paused but not-yet-stopped sandbox from its snapshot.
     ///
     /// Idempotent: calling `resume` more than once must not return an error.
-    async fn resume(&mut self) -> Result<()>;
+    fn resume<'life0, 'async_trait>(&'life0 mut self) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Capture a persistent snapshot from a running sandbox.
     ///
@@ -255,7 +312,12 @@ pub trait SandboxBackend: Send + 'static {
     /// [`SandboxCaptureError::Terminal`] indicates snapshot capture mutated the live
     /// runtime before failing, so callers must not keep treating the sandbox
     /// as safely runnable.
-    async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot>;
+    fn snapshot<'life0, 'async_trait>(
+        &'life0 mut self,
+    ) -> BoxFuture<'async_trait, SandboxCaptureResult<CapturedSandboxSnapshot>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Flush and seal writable persistent-volume upper layers while keeping
     /// the sandbox running.
@@ -276,10 +338,14 @@ pub trait SandboxBackend: Send + 'static {
     /// source runtime past safe resume, so callers must stop treating the
     /// source as runnable. Child construction/start failures after source
     /// recovery belong in the corresponding [`SandboxForkResult`].
-    async fn fork(
-        &mut self,
-        spec: &[SandboxForkSpec],
-    ) -> SandboxCaptureResult<Vec<SandboxForkResult>>;
+    fn fork<'life0, 'life1, 'async_trait>(
+        &'life0 mut self,
+        spec: &'life1 [SandboxForkSpec],
+    ) -> BoxFuture<'async_trait, SandboxCaptureResult<Vec<SandboxForkResult>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Capture the guest into `at` and describe what was written.
     ///
@@ -298,7 +364,10 @@ pub trait SandboxBackend: Send + 'static {
     /// Stop the sandbox and release all associated system resources.
     ///
     /// Idempotent: calling `stop` more than once must not return an error.
-    async fn stop(&mut self) -> Result<()>;
+    fn stop<'life0, 'async_trait>(&'life0 mut self) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Freeze writable persistent filesystems and seal their volume layers,
     /// without capturing memory, rootfs, or VM state. On success, writes remain
@@ -315,6 +384,22 @@ pub trait SandboxBackend: Send + 'static {
     /// Obtain the IP address that the sandbox can use to interact with the host.
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr>;
 
+    /// Whether an authenticated native execution transport is installed.
+    /// This capability never proves a task outcome or physical reclamation.
+    fn native_control(&self) -> Option<super::NativeControl> {
+        None
+    }
+
+    fn native_control_ready(&self) -> bool {
+        false
+    }
+
+    /// Original backend-produced execution cessation evidence. Generic stop
+    /// success, missing owners and persistent deletion cannot mint this value.
+    fn native_execution_stopped(&self) -> Option<Arc<super::firecracker::NativeExecutionStopped>> {
+        None
+    }
+
     /// Return runtime facts that are only known after the backend has started.
     fn runtime_info(&self) -> SandboxRuntimeInfo;
 
@@ -322,7 +407,13 @@ pub trait SandboxBackend: Send + 'static {
     fn startup_artifacts(&self) -> RuntimeArtifactSet;
 
     /// Update the sandbox network policy at runtime.
-    async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()>;
+    fn update_network_policy<'life0, 'async_trait>(
+        &'life0 mut self,
+        policy: Option<SandboxNetworkPolicy>,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Update the custom extension params held by the sandbox runtime.
     ///
@@ -338,6 +429,14 @@ pub trait SandboxBackend: Send + 'static {
 /// [`Orchestrator`][crate::orchestrator::Orchestrator] and is used for every
 /// `create_sandbox` and `resume_sandbox` request.
 pub trait SandboxBackendFactory: Send + Sync + 'static {
+    /// Build only from the unforgeable original Worker/profile capability.
+    fn build_native_original(
+        &self,
+        _promotion: &super::NativeProfilePromotion,
+    ) -> Result<Box<dyn SandboxBackend>> {
+        anyhow::bail!("native original promotion unsupported")
+    }
+
     /// Build a brand-new sandbox backend from a high-level launch request.
     fn build(
         &self,
@@ -400,8 +499,19 @@ pub trait SandboxExecutor: Send {
     /// # Ok(())
     /// # }
     /// ```
-    async fn run_command(&self, cmd: &str, args: &[&str]) -> Result<ProcessOutput> {
-        self.executor()?.run_command(cmd, args).await
+    fn run_command<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        cmd: &'life1 str,
+        args: &'life2 [&'life3 str],
+    ) -> LocalBoxFuture<'async_trait, Result<ProcessOutput>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { self.executor()?.run_command(cmd, args).await })
     }
 
     /// Run a command with custom options and wait for it to complete.
@@ -416,15 +526,25 @@ pub trait SandboxExecutor: Send {
     /// # Ok(())
     /// # }
     /// ```
-    async fn run_command_with_opts(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        opts: &ProcessOpts,
-    ) -> Result<ProcessOutput> {
-        self.executor()?
-            .run_command_with_opts(cmd, args, opts)
-            .await
+    fn run_command_with_opts<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(
+        &'life0 self,
+        cmd: &'life1 str,
+        args: &'life2 [&'life3 str],
+        opts: &'life4 ProcessOpts,
+    ) -> LocalBoxFuture<'async_trait, Result<ProcessOutput>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.executor()?
+                .run_command_with_opts(cmd, args, opts)
+                .await
+        })
     }
 
     /// Create a directory (and any missing parents) inside the sandbox.
@@ -441,8 +561,16 @@ pub trait SandboxExecutor: Send {
     /// # Ok(())
     /// # }
     /// ```
-    async fn create_dir_all(&self, path: &str) -> Result<()> {
-        self.executor()?.create_dir_all(path).await
+    fn create_dir_all<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        path: &'life1 str,
+    ) -> LocalBoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { self.executor()?.create_dir_all(path).await })
     }
 
     /// Start a long-running process and return a handle.
@@ -457,12 +585,20 @@ pub trait SandboxExecutor: Send {
     /// # Ok(())
     /// # }
     /// ```
-    async fn start_process(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        opts: &ProcessOpts,
-    ) -> Result<ProcessHandle> {
-        self.executor()?.start_process(cmd, args, opts).await
+    fn start_process<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(
+        &'life0 self,
+        cmd: &'life1 str,
+        args: &'life2 [&'life3 str],
+        opts: &'life4 ProcessOpts,
+    ) -> LocalBoxFuture<'async_trait, Result<ProcessHandle>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { self.executor()?.start_process(cmd, args, opts).await })
     }
 }

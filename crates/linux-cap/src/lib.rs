@@ -66,7 +66,7 @@ impl CapabilitySets {
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("{name} is missing from /proc/self/status"),
+                        format!("{name} is missing from /proc/thread-self/status"),
                     )
                 })?;
             u64::from_str_radix(value.trim(), 16)
@@ -81,7 +81,7 @@ impl CapabilitySets {
     }
 
     pub fn current() -> io::Result<Self> {
-        Self::from_proc_status(&fs::read_to_string("/proc/self/status")?)
+        Self::from_proc_status(&fs::read_to_string("/proc/thread-self/status")?)
     }
 
     /// Return whether a capability can be delegated through the ambient set:
@@ -131,6 +131,27 @@ pub fn clear_ambient_capabilities() -> io::Result<()> {
     }
 }
 
+// Also used from the ublk child-only pre_exec path: no allocation or procfs.
+fn current_thread_has_setpcap() -> io::Result<bool> {
+    let mut header = CapabilityHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapabilityData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; CAPABILITY_SET_COUNT];
+    // SAFETY: version-3 capget writes exactly the two initialized stack records;
+    // pid 0 requests the calling thread's capability sets.
+    let rc = unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) };
+    if rc == 0 {
+        Ok(data[0].effective & (1 << 8) != 0)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn set_capability_sets(capabilities: &[i32]) -> io::Result<()> {
     let masks = capability_masks(capabilities)?;
     let header = CapabilityHeader {
@@ -172,14 +193,72 @@ fn raise_ambient_capability(capability: i32) -> io::Result<()> {
     }
 }
 
-/// Replace the current process capability sets with exactly `capabilities`
-/// and raise those capabilities into the ambient set for the next `exec`.
-/// The capability bounding set is intentionally left unchanged.
+// These operations are thread-scoped. Call only on a disposable launcher
+// thread or an exec child, never on a reusable server thread.
+fn prctl_value(option: libc::c_int, value: libc::c_ulong) -> io::Result<libc::c_int> {
+    // SAFETY: all callers use documented scalar-only prctl operations.
+    let result = unsafe { libc::prctl(option, value, 0, 0, 0) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result)
+    }
+}
+
+fn constrain_exec_privileges(capabilities: &[i32]) -> io::Result<()> {
+    let requested = capability_masks(capabilities)?;
+    // Root exec otherwise reconstructs permitted/effective capabilities from
+    // the bounding set, even after an empty capset. Set securebits while the
+    // disposable thread still has CAP_SETPCAP; preserve every existing bit.
+    // SAFETY: getuid/geteuid take no arguments and have no memory effects.
+    let root = unsafe { libc::getuid() == 0 || libc::geteuid() == 0 };
+    if root {
+        const NOROOT_AND_LOCKED: libc::c_ulong = 1 | 2;
+        let bits = prctl_value(libc::PR_GET_SECUREBITS, 0)? as libc::c_ulong;
+        if bits & NOROOT_AND_LOCKED != NOROOT_AND_LOCKED {
+            prctl_value(libc::PR_SET_SECUREBITS, bits | NOROOT_AND_LOCKED)?;
+        }
+        // An already locked NOROOT thread needs no new authority to preserve
+        // its bounding set. NNP and exact P/I/E/ambient sets still constrain exec.
+        // Narrow the bounding set only with this thread's effective SETPCAP.
+        if current_thread_has_setpcap()? {
+            for capability in 0..MAX_CAPABILITY {
+                let bounded = match prctl_value(libc::PR_CAPBSET_READ, capability as libc::c_ulong)
+                {
+                    Ok(value) => value != 0,
+                    Err(error) if error.raw_os_error() == Some(libc::EINVAL) => break,
+                    Err(error) => return Err(error),
+                };
+                let wanted = requested[capability / CAPABILITIES_PER_SET]
+                    & (1 << (capability % CAPABILITIES_PER_SET))
+                    != 0;
+                if bounded && !wanted && capability != 8 {
+                    prctl_value(libc::PR_CAPBSET_DROP, capability as libc::c_ulong)?;
+                }
+            }
+            // CAP_SETPCAP (8) must be the final drop, after all other changes.
+            if requested[0] & (1 << 8) == 0 && prctl_value(libc::PR_CAPBSET_READ, 8)? != 0 {
+                prctl_value(libc::PR_CAPBSET_DROP, 8)?;
+            }
+        }
+    }
+    // Ordinary non-root ambient delegation still works. Set-id/file-cap exec
+    // cannot add privileges, and the setting remains inherited across exec.
+    prctl_value(libc::PR_SET_NO_NEW_PRIVS, 1)?;
+    Ok(())
+}
+
+/// Replace the disposable launcher thread / exec child's capability sets with
+/// exactly `capabilities`, and delegate those capabilities through ambient exec.
+/// Root exec semantics are disabled. With SETPCAP its bounding set is narrowed before
+/// CAP_SETPCAP is discarded. Existing securebits are never cleared. Failure
+/// refuses the launch; callers must not reuse this partially constrained thread.
 ///
-/// This function performs only validation and Linux syscalls, so callers may
-/// use it from a `pre_exec` closure.
+/// Performs validation and Linux syscalls only, including when called from the
+/// ublk daemon's child-only `pre_exec` closure.
 pub fn configure_current_process_capabilities(capabilities: &[i32]) -> io::Result<()> {
     capability_masks(capabilities)?;
+    constrain_exec_privileges(capabilities)?;
     clear_ambient_capabilities()?;
     set_capability_sets(capabilities)?;
     for capability in capabilities {

@@ -43,27 +43,44 @@ pub trait Admin<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::ErrorHa
     /// List nodes.
     ///
     /// NodesGet - GET /nodes
-    async fn nodes_get(
-        &self,
+    fn nodes_get<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        query_params: &models::NodesGetQueryParams,
-    ) -> Result<NodesGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        query_params: &'life5 models::NodesGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<NodesGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 
     /// Node info.
     ///
     /// NodesNodeIdGet - GET /nodes/{nodeID}
-    async fn nodes_node_id_get(
-        &self,
+    fn nodes_node_id_get<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'life6, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::NodesNodeIdGetPathParams,
-        query_params: &models::NodesNodeIdGetQueryParams,
-    ) -> Result<NodesNodeIdGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::NodesNodeIdGetPathParams,
+        query_params: &'life6 models::NodesNodeIdGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<NodesNodeIdGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        'life6: 'async_trait,
+        Self: 'async_trait;
 }

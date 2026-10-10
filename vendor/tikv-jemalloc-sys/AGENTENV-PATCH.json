@@ -1,0 +1,25 @@
+{
+  "crate": "tikv-jemalloc-sys-0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7",
+  "registry_vcs": {
+    "git": {
+      "sha1": "df5934f67d7b462b431f7fe9658952178c2bf2f4"
+    },
+    "path_in_vcs": "jemalloc-sys"
+  },
+  "purpose": "Use unsigned arena flag shifts to avoid signed int overflow under checked C builds; preserve the public int flag bit pattern.",
+  "patches": [
+    {
+      "path": "jemalloc/include/jemalloc/internal/jemalloc_internal_types.h",
+      "original_sha256": "b65870428707156fa7c28d1650c551281574569892f923e0ee4788d3599b7a8b",
+      "patched_sha256": "fa6bbe2c2b26620ab1349415ffdb90940db5a5fce00a1dc29b1f4943ecd39689"
+    },
+    {
+      "path": "jemalloc/include/jemalloc/jemalloc_macros.h.in",
+      "original_sha256": "ed44b9c71ffd2110d3bf4afa0bbc2620c047aff8e1ffd7b8abbc9d62a4810f3a",
+      "patched_sha256": "0bd2ba4ccaedc5629243a25d6fae1b99636024c404e60863ee27dac2fd67d224"
+    }
+  ],
+  "original_crates_io_archive_sha256": "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b",
+  "regression": "tests/verify-jemalloc-arena-flags.rs",
+  "target_contract": "32-bit int flags on x86_64 Linux; unsigned to signed conversion preserves target bit pattern"
+}

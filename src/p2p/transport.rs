@@ -1,3 +1,4 @@
+use futures::future::BoxFuture;
 use std::path::Path;
 use std::pin::Pin;
 
@@ -16,16 +17,29 @@ pub type P2pByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send + 'stat
 /// Abstraction for artifact discovery and transfer between peers.
 pub trait P2pTransport: Send + Sync {
     /// Resolve an artifact descriptor for a key using the transport's configured discovery.
-    async fn lookup(&self, key: &P2pArtifactKey) -> Result<Option<P2pArtifactDescriptor>> {
-        self.lookup_with_hints(key, &[]).await
+    fn lookup<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        key: &'life1 P2pArtifactKey,
+    ) -> BoxFuture<'async_trait, Result<Option<P2pArtifactDescriptor>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { self.lookup_with_hints(key, &[]).await })
     }
 
     /// Resolve an artifact descriptor for a key, prioritizing provider hints supplied by callers.
-    async fn lookup_with_hints(
-        &self,
-        key: &P2pArtifactKey,
-        hints: &[P2pArtifactProviderHint],
-    ) -> Result<Option<P2pArtifactDescriptor>>;
+    fn lookup_with_hints<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        key: &'life1 P2pArtifactKey,
+        hints: &'life2 [P2pArtifactProviderHint],
+    ) -> BoxFuture<'async_trait, Result<Option<P2pArtifactDescriptor>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait;
 
     /// Download the artifact described by `descriptor` into `destination` using default options and return its size in bytes.
     async fn fetch(&self, descriptor: &P2pArtifactDescriptor, destination: &Path) -> Result<u64> {
@@ -65,23 +79,41 @@ pub trait P2pTransport: Send + Sync {
     /// Implementations must yield exactly `len` bytes or end the stream with an
     /// error. Callers may already have committed response headers before polling
     /// the stream, so short reads must not complete successfully.
-    async fn fetch_byte_range(
-        &self,
-        descriptor: &P2pArtifactDescriptor,
+    fn fetch_byte_range<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        descriptor: &'life1 P2pArtifactDescriptor,
         offset: u64,
         len: usize,
-    ) -> Result<P2pByteStream>;
+    ) -> BoxFuture<'async_trait, Result<P2pByteStream>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Publish a local artifact to the transport.
     ///
     /// Disabled transports return `Ok(())` so callers can treat P2P publishing
     /// as an optional acceleration path.
-    async fn publish(&self, request: &P2pPublishRequest) -> Result<()>;
+    fn publish<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        request: &'life1 P2pPublishRequest,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Stop advertising a local artifact.
     ///
     /// Returns `true` when a local publication was removed, `false` when no local artifact existed for the key.
-    async fn unpublish(&self, key: &P2pArtifactKey) -> Result<bool>;
+    fn unpublish<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        key: &'life1 P2pArtifactKey,
+    ) -> BoxFuture<'async_trait, Result<bool>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Return the local endpoint if this transport exposes one.
     fn local_endpoint(&self) -> Option<P2pEndpoint> {
@@ -89,8 +121,12 @@ pub trait P2pTransport: Send + Sync {
     }
 
     /// Shut down the transport and release resources.
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
+    fn shutdown<'life0, 'async_trait>(&'life0 self) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { Ok(()) })
     }
 }
 
