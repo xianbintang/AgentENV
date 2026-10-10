@@ -4,6 +4,51 @@
 //! Public HTTP create remains unavailable; no Front adapter is installed.
 //! Worker issuer authority is obtained through the existing reciprocal requester;
 //! packet fields never constitute a reservation grant or backend authority.
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum DiagnosticStage {
+    Gate,
+    Reserve,
+    Launch,
+    Execution,
+}
+#[cfg(test)]
+struct StageDiagnostic {
+    started: Instant,
+    until: Instant,
+    stage: DiagnosticStage,
+    ok: bool,
+}
+#[cfg(test)]
+impl StageDiagnostic {
+    fn new(until: Instant) -> Self {
+        Self {
+            started: Instant::now(),
+            until,
+            stage: DiagnosticStage::Gate,
+            ok: false,
+        }
+    }
+    fn stage(&mut self, stage: DiagnosticStage) {
+        self.stage = stage;
+        self.ok = false;
+    }
+}
+#[cfg(test)]
+impl Drop for StageDiagnostic {
+    fn drop(&mut self) {
+        eprintln!(
+            "native_retained stage={:?} ok={} elapsed_ms={} remaining_ms={}",
+            self.stage,
+            self.ok,
+            self.started.elapsed().as_millis(),
+            self.until
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+        );
+    }
+}
 use super::native_issuer::{
     alive, same, validate_peer, Endpoint, Held, Peer, Publication, RequestDto, Worker,
 };
@@ -628,6 +673,8 @@ impl Ingress {
                 let original_digest = state.records[index].digest.clone();
                 let (start, gate) = tokio::sync::oneshot::channel();
                 let task = tokio::spawn(async move {
+                    #[cfg(test)]
+                    let mut diagnostic = StageDiagnostic::new(until);
                     let permit = async {
                         gate.await?;
                         admission.permit(until).await
@@ -653,8 +700,12 @@ impl Ingress {
                     // effect; native_launch_original retains its original owner.
                     let result = async {
                         ensure!(Instant::now() < until, "late original reserve dispatch");
+                        #[cfg(test)]
+                        diagnostic.stage(DiagnosticStage::Reserve);
                         sdk.native_reserve_original(&original, epoch)?;
                         ensure!(Instant::now() < until, "late original launch dispatch");
+                        #[cfg(test)]
+                        diagnostic.stage(DiagnosticStage::Launch);
                         sdk.native_launch_original(&operation, canonical.as_bytes())
                             .await
                             .map_err(anyhow::Error::from)
@@ -678,8 +729,14 @@ impl Ingress {
                         r.sandbox = Some(meta.id.to_string());
                         r.status = Status::Ready;
                     }
+                    #[cfg(test)]
+                    {
+                        diagnostic.ok = true;
+                    }
                     if FixedLaunch::parse(canonical.as_bytes()).is_some() {
                         let commit_owner = retained.clone();
+                        #[cfg(test)]
+                        diagnostic.stage(DiagnosticStage::Execution);
                         let execution = sdk
                             .native_execute_original(
                                 OriginalExecution {
@@ -716,6 +773,10 @@ impl Ingress {
                                 },
                             )
                             .await;
+                        #[cfg(test)]
+                        {
+                            diagnostic.ok = execution.is_ok();
+                        }
                         if let Ok((receipt, stdout, stderr)) = execution {
                             let mut state = retained.lock().unwrap_or_else(|p| p.into_inner());
                             let r = &mut state.records[index];

@@ -1,4 +1,52 @@
 //! Reciprocal protected Worker issuer transport; no VM or launch receipt.
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum DiagnosticStage {
+    Endpoint,
+    Exchange,
+    ReplyDecode,
+    GrantValidate,
+    Deadline,
+    StateVerify,
+    FinalDeadline,
+}
+#[cfg(test)]
+struct StageDiagnostic {
+    started: Instant,
+    until: Instant,
+    stage: DiagnosticStage,
+    ok: bool,
+}
+#[cfg(test)]
+impl StageDiagnostic {
+    fn new(until: Instant) -> Self {
+        Self {
+            started: Instant::now(),
+            until,
+            stage: DiagnosticStage::Endpoint,
+            ok: false,
+        }
+    }
+    fn stage(&mut self, stage: DiagnosticStage) {
+        self.stage = stage;
+        self.ok = false;
+    }
+}
+#[cfg(test)]
+impl Drop for StageDiagnostic {
+    fn drop(&mut self) {
+        eprintln!(
+            "native_reserve stage={:?} ok={} elapsed_ms={} remaining_ms={}",
+            self.stage,
+            self.ok,
+            self.started.elapsed().as_millis(),
+            self.until
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+        );
+    }
+}
 use anyhow::{ensure, Context, Result};
 use nix::{
     poll::{poll, PollFd, PollFlags},
@@ -1025,6 +1073,10 @@ struct NativeLaunchSpec {
     schema: u32,
     memory_mib: u32,
 }
+// Shared production boundary after authentic same-owner promotion.
+fn launch_material_memory(canonical: &[u8]) -> Result<u32> {
+    super::native_worker_ingress::validated_launch_memory(canonical)
+}
 /// Unforgeable per-original profile/lease capability; only retained authenticated
 /// requester records can mint it. No Deserialize or public constructor.
 pub struct NativeProfilePromotion {
@@ -1348,12 +1400,16 @@ impl NativeIssuerRequester {
             );
             let i = state.pending.take().unwrap();
             state.records.insert(r.context.operation_id.clone(), i);
+            #[cfg(test)]
+            let mut diagnostic = StageDiagnostic::new(until);
             let (endpoint_pin, raw) = Held::load(&state.endpoint_path)?;
             let endpoint: Endpoint = serde_json::from_slice(&raw)?;
             ensure!(
                 endpoint.worker == r.context.target,
                 "issuer target mismatch"
             );
+            #[cfg(test)]
+            diagnostic.stage(DiagnosticStage::Exchange);
             let response = exchange_raw(
                 &endpoint,
                 &state.publication,
@@ -1363,11 +1419,25 @@ impl NativeIssuerRequester {
                 &mut Phase::Setup,
             )?;
             endpoint_pin.verify()?;
+            #[cfg(test)]
+            diagnostic.stage(DiagnosticStage::ReplyDecode);
             let grant = reserved_reply(&response)?;
+            #[cfg(test)]
+            diagnostic.stage(DiagnosticStage::GrantValidate);
             grant.validate(&r, epoch)?;
+            #[cfg(test)]
+            diagnostic.stage(DiagnosticStage::Deadline);
             grant.deadline()?;
+            #[cfg(test)]
+            diagnostic.stage(DiagnosticStage::StateVerify);
             verify_state(state)?;
+            #[cfg(test)]
+            diagnostic.stage(DiagnosticStage::FinalDeadline);
             ensure!(Instant::now() < until, "issuer reservation completed late");
+            #[cfg(test)]
+            {
+                diagnostic.ok = true;
+            }
             Ok(grant)
         })();
         if let Ok(grant) = &result {
@@ -1580,7 +1650,7 @@ impl NativeIssuerRequester {
         factory: &dyn super::SandboxBackendFactory,
     ) -> Result<NativeLaunchOwner> {
         let owner = self.promote_owner(operation_id, canonical, factory)?;
-        let spec: NativeLaunchSpec = serde_json::from_slice(canonical)?;
+        let memory_mib = launch_material_memory(canonical)?;
         let i = self.records.get_mut(operation_id).unwrap();
         ensure!(
             !i.launch_started,
@@ -1594,7 +1664,7 @@ impl NativeIssuerRequester {
             expires: i.expires.unwrap(),
             rootfs_path: allocation.rootfs_path.clone(),
             rootfs_sha256: allocation.rootfs_sha256.clone(),
-            memory_mib: spec.memory_mib,
+            memory_mib,
         })
     }
     pub(crate) fn cache_ready(&mut self, operation_id: &str, receipt: Vec<u8>) -> Result<()> {
@@ -2028,6 +2098,34 @@ mod production_tests {
         receipt.expires_monotonic_ns = 1;
         assert!(receipt.deadline().is_err());
     }
+    // This boundary oracle exercises the parser used after authentic promotion.
+    // It grants no authority and creates no backend; begin_launch calls this
+    // same helper only after authentic same-owner promotion.
+    #[test]
+    fn fixed_launch_material_parser_accepts_the_admitted_closed_canonical() {
+        let fixed = super::super::native_worker_ingress::FixedLaunch::selected(None).unwrap();
+        let canonical = serde_json::to_vec(&fixed).unwrap();
+        assert_eq!(
+            super::super::native_worker_ingress::validated_launch_memory(&canonical).unwrap(),
+            512
+        );
+        // Same production boundary called by begin_launch after owner promotion.
+        assert_eq!(launch_material_memory(&canonical).unwrap(), 512);
+        let schema1 = br#"{"schema":1,"memory_mib":128}"#;
+        assert_eq!(launch_material_memory(schema1).unwrap(), 128);
+        let mut drift = serde_json::to_value(&fixed).unwrap();
+        drift["plan"]["command"] = serde_json::json!("/foreign");
+        assert!(launch_material_memory(&serde_json::to_vec(&drift).unwrap()).is_err());
+        assert!(
+            launch_material_memory(br#"{"schema":1,"memory_mib":128,"profile":"/foreign"}"#)
+                .is_err()
+        );
+        assert!(launch_material_memory(br#"{"schema":1,"schema":1,"memory_mib":128}"#).is_err());
+        let mut noncanonical = canonical.clone();
+        noncanonical.push(b' ');
+        assert!(launch_material_memory(&noncanonical).is_err());
+    }
+
     #[test]
     fn native_launch_spec_is_closed_canonical_and_binds_exact_digest() {
         let canonical = br#"{"schema":1,"memory_mib":128}"#;
