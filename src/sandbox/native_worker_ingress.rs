@@ -233,6 +233,45 @@ enum Status {
     Unknown,
     ExecutionStopped,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureStage {
+    Gate,
+    Reserve,
+    PreLaunchDeadline,
+    Launch,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct OrchestrationFailure {
+    schema_version: u32,
+    stage: FailureStage,
+    kind: &'static str,
+    retry_forbidden: bool,
+}
+fn retain_original_failure(state: &Arc<Mutex<State>>, index: usize, stage: FailureStage) {
+    let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+    let record = &mut state.records[index];
+    record.status = Status::Unknown;
+    if record.orchestration_failure.is_none() {
+        record.orchestration_failure = Some(OrchestrationFailure {
+            schema_version: 1,
+            stage,
+            kind: "returned_error",
+            retry_forbidden: true,
+        });
+    }
+}
+fn query_failure(
+    schema: u32,
+    status: Status,
+    failure: Option<&OrchestrationFailure>,
+) -> Option<&OrchestrationFailure> {
+    if schema == 4 && status == Status::Unknown {
+        failure
+    } else {
+        None
+    }
+}
 #[derive(Clone, Serialize)]
 struct ExecutionReceipt {
     grant_sha256: String,
@@ -256,6 +295,8 @@ struct Reply<'a> {
     completion: Option<&'a Completion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<OutputChunk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orchestration_failure: Option<&'a OrchestrationFailure>,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum ConnectionOutcome {
@@ -295,6 +336,7 @@ struct Record {
     stop_until: Option<Instant>,
     execution: Option<ExecutionReceipt>,
     completion: Option<Completion>,
+    orchestration_failure: Option<OrchestrationFailure>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -661,6 +703,7 @@ impl Ingress {
                     stop_until: None,
                     execution: None,
                     completion: None,
+                    orchestration_failure: None,
                     stdout: Vec::new(),
                     stderr: Vec::new(),
                 });
@@ -685,21 +728,20 @@ impl Ingress {
                     let _permit = match permit {
                         Ok(permit) => permit,
                         Err(_) => {
-                            retained.lock().unwrap_or_else(|p| p.into_inner()).records[index]
-                                .status = Status::Unknown;
+                            retain_original_failure(&retained, index, FailureStage::Gate);
                             return;
                         }
                     };
                     let _original_permit = match original_admission.permit(until).await {
                         Ok(permit) => permit,
                         Err(_) => {
-                            retained.lock().unwrap_or_else(|p| p.into_inner()).records[index]
-                                .status = Status::Unknown;
+                            retain_original_failure(&retained, index, FailureStage::Gate);
                             return;
                         }
                     };
                     // Genuine reciprocal Worker reservation precedes every backend
                     // effect; native_launch_original retains its original owner.
+                    let mut failure_stage = FailureStage::Reserve;
                     let result = async {
                         ensure!(Instant::now() < until, "late original reserve dispatch");
                         #[cfg(test)]
@@ -716,11 +758,13 @@ impl Ingress {
                             );
                         }
                         reserved?;
+                        failure_stage = FailureStage::PreLaunchDeadline;
                         #[cfg(test)]
                         diagnostic.stage(DiagnosticStage::PreLaunchDeadline);
                         ensure!(Instant::now() < until, "late original launch dispatch");
                         #[cfg(test)]
                         diagnostic.stage(DiagnosticStage::Launch);
+                        failure_stage = FailureStage::Launch;
                         sdk.native_launch_original(&operation, canonical.as_bytes())
                             .await
                             .map_err(anyhow::Error::from)
@@ -729,8 +773,7 @@ impl Ingress {
                     let meta = match result {
                         Ok(meta) => meta,
                         Err(_) => {
-                            retained.lock().unwrap_or_else(|p| p.into_inner()).records[index]
-                                .status = Status::Unknown;
+                            retain_original_failure(&retained, index, failure_stage);
                             return;
                         }
                     };
@@ -919,6 +962,11 @@ impl Ingress {
                     None
                 },
                 output,
+                orchestration_failure: query_failure(
+                    wire.schema,
+                    project_status(wire.schema, r.status, r.stop_job.is_some()),
+                    r.orchestration_failure.as_ref(),
+                ),
                 execution: if wire.schema == 2 && matches!(r.status, Status::ExecutionStopped) {
                     r.execution.as_ref()
                 } else {
@@ -962,7 +1010,7 @@ fn missing_original_outcome(kind: Kind) -> Option<ConnectionOutcome> {
 // original can never project Ready to an older reader. Schema 2 is explicitly
 // negotiated by Stop or Query and alone carries the narrow execution receipt.
 fn project_status(schema: u32, status: Status, stopping: bool) -> Status {
-    if schema == 1 && (stopping || matches!(status, Status::ExecutionStopped)) {
+    if matches!(schema, 1 | 4) && (stopping || matches!(status, Status::ExecutionStopped)) {
         Status::Unknown
     } else {
         status
@@ -975,6 +1023,7 @@ fn validate(w: &Wire, worker: &Worker, sdk: &str) -> Result<()> {
             (1, Kind::Start | Kind::Query)
                 | (2, Kind::Stop | Kind::Query)
                 | (3, Kind::ExecutionQuery | Kind::ExecutionRead)
+                | (4, Kind::Query)
         ) && w.authority_epoch > 0
             && w.original.context.target == *worker
             && w.original.server_incarnation == sdk,
@@ -1101,6 +1150,7 @@ mod tests {
                 stop_until: None,
                 execution: None,
                 completion: None,
+                orchestration_failure: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             }],
@@ -1329,6 +1379,177 @@ mod tests {
         w.kind = Kind::Query;
         assert!(validate(&w, &worker, &sdk).is_err());
     }
+    #[tokio::test]
+    async fn retained_original_task_error_is_query4_sticky_without_execution() {
+        for stage in [
+            FailureStage::Gate,
+            FailureStage::Reserve,
+            FailureStage::PreLaunchDeadline,
+            FailureStage::Launch,
+        ] {
+            let w = wire();
+            let state = Arc::new(Mutex::new(State {
+                records: vec![Record {
+                    original: w.original.clone(),
+                    canonical: w.canonical_launch.clone(),
+                    epoch: w.authority_epoch,
+                    digest: w.original_sha256.clone(),
+                    status: Status::Starting,
+                    sandbox: None,
+                    job: None,
+                    admission: Arc::new(Admission::new()),
+                    fenced: false,
+                    stop_job: None,
+                    stop_until: None,
+                    execution: None,
+                    completion: None,
+                    orchestration_failure: None,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }],
+                bytes: FIXED + TICKET,
+                closed: false,
+            }));
+            let (release, gate) = tokio::sync::oneshot::channel();
+            let owner = state.clone();
+            let task = tokio::spawn(async move {
+                // The retained task actually returns an error through its owned
+                // gate; no assignment of a fake successful receipt or VM effect.
+                let result: Result<()> = async {
+                    gate.await?;
+                    anyhow::bail!("test retained error")
+                }
+                .await;
+                if result.is_err() {
+                    retain_original_failure(&owner, 0, stage);
+                }
+            });
+            let job = Arc::new(tokio::sync::Mutex::new(LaunchJob {
+                handle: Some(task),
+                failed: false,
+            }));
+            state.lock().unwrap().records[0].job = Some(job.clone());
+            assert!(state.lock().unwrap().records[0]
+                .orchestration_failure
+                .is_none());
+            release.send(()).unwrap();
+            join_launch(&job, Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            {
+                let mut state = state.lock().unwrap();
+                let r = &mut state.records[0];
+                assert_eq!(r.status, Status::Unknown);
+                let failure = r.orchestration_failure.as_ref().unwrap();
+                assert_eq!(failure.stage, stage);
+                let bytes = serde_json::to_vec(failure).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["schema_version"], 1);
+                assert_eq!(value["kind"], "returned_error");
+                assert_eq!(value["retry_forbidden"], true);
+                for schema in 1..=3 {
+                    assert!(query_failure(schema, r.status, Some(failure)).is_none());
+                }
+                assert!(query_failure(4, r.status, Some(failure)).is_some());
+                assert!(query_failure(4, Status::Ready, Some(failure)).is_none());
+                // Same original Stop fence retains failure and charged records.
+                r.fenced = true;
+                r.admission.close();
+                assert!(r.execution.is_none() && r.completion.is_none());
+                // Actual failure remains immutable after the raw stopped status
+                // projects to Unknown for schema4. This is wire projection, not
+                // a claim of physical Stop qualification.
+                r.status = Status::ExecutionStopped;
+                let projected = project_status(4, r.status, true);
+                assert_eq!(projected, Status::Unknown);
+                let mut reply = Reply {
+                    schema: 4,
+                    worker: &r.original.context.target,
+                    operation_id: &r.original.context.operation_id,
+                    request_sha256: &r.original.request_sha256,
+                    server_incarnation: &r.original.server_incarnation,
+                    sandbox_id: r.sandbox.as_deref(),
+                    status: projected,
+                    authority_epoch: r.epoch,
+                    original_sha256: &r.digest,
+                    execution: None,
+                    completion: None,
+                    output: None,
+                    orchestration_failure: query_failure(
+                        4,
+                        projected,
+                        r.orchestration_failure.as_ref(),
+                    ),
+                };
+                let queried: serde_json::Value =
+                    serde_json::from_slice(&serde_json::to_vec(&reply).unwrap()).unwrap();
+                assert_eq!(queried["status"], "unknown");
+                assert_eq!(queried["orchestration_failure"], value);
+                assert!(queried.get("execution").is_none());
+                let stopped = ExecutionReceipt {
+                    grant_sha256: "a".repeat(64),
+                    network_returned: false,
+                    persistent_artifacts_retained: true,
+                };
+                reply.schema = 2;
+                reply.status = project_status(2, r.status, true);
+                reply.execution = Some(&stopped);
+                reply.orchestration_failure =
+                    query_failure(2, reply.status, r.orchestration_failure.as_ref());
+                let narrow: serde_json::Value =
+                    serde_json::from_slice(&serde_json::to_vec(&reply).unwrap()).unwrap();
+                assert_eq!(narrow["status"], "execution_stopped");
+                assert_eq!(narrow["execution"]["grant_sha256"], "a".repeat(64));
+                assert_eq!(narrow["execution"]["persistent_artifacts_retained"], true);
+                assert!(narrow.get("orchestration_failure").is_none());
+                assert!(query_failure(
+                    2,
+                    project_status(2, r.status, true),
+                    r.orchestration_failure.as_ref()
+                )
+                .is_none());
+                assert!(r.stdout.is_empty() && r.stderr.is_empty());
+                assert!(r
+                    .job
+                    .as_ref()
+                    .is_some_and(|retained| Arc::ptr_eq(retained, &job)));
+                assert_eq!(state.bytes, FIXED + TICKET);
+            }
+            retain_original_failure(&state, 0, FailureStage::Launch);
+            assert_eq!(
+                state.lock().unwrap().records[0]
+                    .orchestration_failure
+                    .as_ref()
+                    .unwrap()
+                    .stage,
+                stage
+            );
+            let mut query = wire();
+            query.schema = 4;
+            query.kind = Kind::Query;
+            assert!(validate(
+                &query,
+                &query.original.context.target,
+                &query.original.server_incarnation
+            )
+            .is_ok());
+            for kind in [
+                Kind::Start,
+                Kind::Stop,
+                Kind::ExecutionQuery,
+                Kind::ExecutionRead,
+            ] {
+                query.kind = kind;
+                assert!(validate(
+                    &query,
+                    &query.original.context.target,
+                    &query.original.server_incarnation
+                )
+                .is_err());
+            }
+        }
+    }
+
     #[test]
     fn legacy_query_after_stop_omits_receipt_and_never_projects_ready() {
         #[derive(Deserialize)]
@@ -1375,6 +1596,7 @@ mod tests {
                 original_sha256: &w.original_sha256,
                 execution: None,
                 completion: None,
+                orchestration_failure: None,
                 output: None,
             };
             let raw = serde_json::to_vec(&reply).unwrap();
