@@ -1189,3 +1189,152 @@ async fn native_api_failed_stop_keeps_original_query_sealed_until_retry() {
     assert_eq!(queried["result"]["state"], "running");
     assert_eq!(behavior.stop_calls(), 2);
 }
+
+// Real original actor + authenticated public API; lifecycle backend faults are
+// scripted. This does not claim physical VM capture or Stop qualification.
+#[tokio::test]
+async fn native_api_terminal_capture_failed_stop_retains_original_query_and_output() {
+    use crate::orchestrator::SandboxState;
+    use crate::sandbox::mock::{MockAction, MockOperation};
+    use std::time::Duration;
+    for operation in [MockOperation::Pause, MockOperation::Snapshot] {
+        let (api, _root) = build_api_with_auth_retained(Vec::new(), KEY).await;
+        let owner = api.orchestrator();
+        let id = SandboxId::new();
+        let (control, peer) = NativeControl::test_pair(41);
+        let epoch = control.epoch().to_owned();
+        let behavior = owner.set_native_control_for_test(id, control.clone()).await;
+        let capacity = owner.metrics_snapshot().await.unwrap();
+        assert!(capacity.allocated_cpu > 0 && capacity.allocated_memory_bytes > 0);
+        let app = server::new(api);
+        let mut peer = BufReader::new(peer);
+        let admitted = app
+            .clone()
+            .oneshot(request(
+                id,
+                exec(&epoch, "original", "/bin/echo"),
+                true,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let admitted = value(admitted).await;
+        let original = metadata_frame(&mut peer).await;
+        assert_eq!(original["kind"], "exec");
+        metadata_reply(
+            &mut peer,
+            &original,
+            "output",
+            json!({"sequence":0,"stream":"stdout","data":"eA=="}),
+        )
+        .await;
+        let retained_output = metadata_frame(&mut peer).await;
+        assert_eq!(retained_output["kind"], "retain_ack");
+        assert_eq!(retained_output["operation_id"], original["operation_id"]);
+        behavior.push_action(
+            operation,
+            MockAction::FailTerminal {
+                message: "terminal original capture".into(),
+            },
+        );
+        behavior.push_action(
+            MockOperation::Stop,
+            MockAction::Fail {
+                message: "original Stop unknown".into(),
+            },
+        );
+        let failed = tokio::time::timeout(Duration::from_secs(2), async {
+            if operation == MockOperation::Pause {
+                owner.pause_sandbox(id).await
+            } else {
+                owner.capture_snapshot(id).await.map(|_| ())
+            }
+        })
+        .await
+        .expect("bounded terminal capture");
+        assert!(failed.is_err());
+        assert_eq!(
+            owner.get_sandbox(&id).await.unwrap().unwrap().state,
+            SandboxState::Killing
+        );
+        // Same backend Arc and Stop{capture_failed:true} are separately checked
+        // by the orchestrator terminal-capture regressions; no custody getter.
+        assert_eq!(owner.metrics_snapshot().await.unwrap(), capacity);
+        assert_eq!(behavior.stop_calls(), 1);
+        assert_eq!(
+            owner
+                .native_control_for(id)
+                .await
+                .map(|c| c.epoch().to_owned())
+                .as_deref(),
+            Some(epoch.as_str())
+        );
+        let denied = app
+            .clone()
+            .oneshot(request(id, exec(&epoch, "new", "/bin/echo"), true, false))
+            .await
+            .unwrap();
+        assert_ne!(denied.status(), StatusCode::OK);
+        let query = tokio::spawn({
+            let app = app.clone();
+            let epoch = epoch.clone();
+            async move {
+                app.oneshot(request(
+                    id,
+                    json!({"epoch":epoch,"operation_id":"original","request":{"kind":"query"}}),
+                    true,
+                    false,
+                ))
+                .await
+                .unwrap()
+            }
+        });
+        let query_frame = metadata_frame(&mut peer).await;
+        // A forbidden second Exec would be the next frame and fail this check.
+        assert_eq!(query_frame["kind"], "query");
+        assert_eq!(query_frame["session_id"], original["session_id"]);
+        assert_eq!(query_frame["operation_id"], original["operation_id"]);
+        metadata_reply(
+            &mut peer,
+            &original,
+            "status",
+            json!({"state":"running","acked_sequence":0}),
+        )
+        .await;
+        let queried = tokio::time::timeout(Duration::from_secs(2), query)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queried.status(), StatusCode::OK);
+        let queried = value(queried).await;
+        assert_eq!(queried["result"]["operation_id"], admitted["operation_id"]);
+        let output = app.clone().oneshot(request(id, json!({"epoch":epoch,"operation_id":"original","request":{"kind":"exec_read","stream":"stdout","offset":0,"length":1}}), true, false)).await.unwrap();
+        assert_eq!(output.status(), StatusCode::OK);
+        let output = value(output).await;
+        assert_eq!(output["kind"], "output");
+        assert_eq!(output["session_id"], original["session_id"]);
+        assert_eq!(output["operation_id"], original["operation_id"]);
+        assert_eq!(output["data"], "eA==");
+        assert_eq!(output["retained_bytes"], 1);
+        assert_eq!(owner.metrics_snapshot().await.unwrap(), capacity);
+        tokio::time::timeout(Duration::from_secs(2), owner.delete_sandbox(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(behavior.stop_calls(), 2);
+        assert!(owner.get_sandbox(&id).await.unwrap().is_none());
+        assert!(owner.native_control_for(id).await.is_none());
+        let released = owner.metrics_snapshot().await.unwrap();
+        assert_eq!(released.allocated_cpu, 0);
+        assert_eq!(released.allocated_memory_bytes, 0);
+        let mut extra = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), peer.read_line(&mut extra))
+                .await
+                .is_err()
+        );
+        control.close_test();
+        drop(peer);
+    }
+}

@@ -177,6 +177,7 @@ struct ScriptedStoreControl {
     on_add: StoreHookSlot,
     claim_gate: StdMutex<Option<StoreClaimGate>>,
     list_gate: StdMutex<Option<StoreListGate>>,
+    capture_delete_conflict: StdMutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl ScriptedStoreControl {
@@ -271,9 +272,29 @@ impl MetadataStore for ScriptedStore {
     ) -> StdResult<SandboxState, StoreError> {
         match ScriptedStoreControl::take_action(&self.control.update_if_state_actions) {
             StoreAction::Delegate => {
-                self.inner
+                let result = self
+                    .inner
                     .update_state_if_state(sandbox_id, new_state, expected_states)
-                    .await
+                    .await;
+                if matches!(
+                    &result,
+                    Err(StoreError::StateConflict {
+                        actual_state: SandboxState::Pausing | SandboxState::Snapshotting,
+                        ..
+                    })
+                ) && expected_states == [SandboxState::Running, SandboxState::Paused]
+                {
+                    if let Some(notify) = self
+                        .control
+                        .capture_delete_conflict
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                    {
+                        notify.notify_one();
+                    }
+                }
+                result
             }
             StoreAction::Fail(err) => Err(err),
         }
@@ -2058,7 +2079,7 @@ async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_r
 }
 
 #[tokio::test]
-async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics() -> Result<()> {
+async fn capture_snapshot_terminal_failed_stop_retains_owner_until_explicit_retry() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -2074,11 +2095,18 @@ async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics(
         },
     );
     let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[("team", "snapshot-terminal")]))
         .await?;
     let sandbox_id = created.id;
+    let original = orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&sandbox_id)
+        .cloned()
+        .unwrap();
 
     let err = orchestrator
         .capture_snapshot(sandbox_id)
@@ -2092,10 +2120,57 @@ async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics(
         }
     ));
 
-    assert!(
-        orchestrator.get_sandbox(&sandbox_id).await?.is_none(),
-        "terminal snapshot failure should remove sandbox metadata"
+    let retained = orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&sandbox_id)
+        .cloned()
+        .expect("failed physical Stop retains original snapshot backend");
+    assert!(Arc::ptr_eq(&original, &retained));
+    assert_eq!(
+        orchestrator.get_sandbox(&sandbox_id).await?.unwrap().state,
+        SandboxState::Killing
     );
+    assert_eq!(
+        orchestrator.proxy_lookup_for(&sandbox_id).await?,
+        ProxyLookupResult::Unavailable(SandboxState::Killing)
+    );
+    let progress = orchestrator
+        .deletions
+        .lock()
+        .await
+        .get(&sandbox_id)
+        .cloned()
+        .unwrap();
+    assert!(matches!(
+        *progress.lock().await,
+        DeleteProgress::Stop {
+            capture_failed: true
+        }
+    ));
+    assert_eq!(behavior.stop_calls(), 1);
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        0,
+        1,
+        0,
+        created.resources.cpu_count,
+        created.resources.memory_mib,
+    )
+    .await;
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert_eq!(behavior.stop_calls(), 2);
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    assert!(orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&sandbox_id)
+        .is_none());
+    assert!(matches!(*progress.lock().await, DeleteProgress::Done));
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
@@ -6842,5 +6917,182 @@ async fn expired_original_stop_keeps_serialized_delete_owner_without_dispatch() 
     owner.delete_sandbox(id).await?;
     assert_eq!(behavior.stop_calls(), 1);
     assert!(owner.get_sandbox(&id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_pause_failed_stop_retains_same_backend_and_stop_phase() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::FailTerminal {
+            message: "terminal capture refusal".into(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "original backend still live".into(),
+        },
+    );
+    let mut owner = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    Arc::get_mut(&mut owner).unwrap().image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    let id = SandboxId::new();
+    owner
+        .launch_sandbox(create_launch_plan_with_resources(id))
+        .await?;
+    let original = owner.sandboxes.read().await.get(&id).cloned().unwrap();
+    assert!(owner.pause_sandbox(id).await.is_err());
+    let retained = owner
+        .sandboxes
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .expect("failed physical Stop retains original backend");
+    assert!(Arc::ptr_eq(&original, &retained));
+    assert_eq!(
+        owner.store.get(&id).await?.unwrap().state,
+        SandboxState::Killing
+    );
+    assert_eq!(
+        owner.proxy_lookup_for(&id).await?,
+        ProxyLookupResult::Unavailable(SandboxState::Killing)
+    );
+    let progress = owner.deletions.lock().await.get(&id).cloned().unwrap();
+    assert!(matches!(
+        *progress.lock().await,
+        DeleteProgress::Stop {
+            capture_failed: true
+        }
+    ));
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(owner.pause_sandbox(id).await.is_err());
+    assert_eq!(behavior.stop_calls(), 1);
+    owner.delete_sandbox(id).await?;
+    assert_eq!(behavior.stop_calls(), 2);
+    assert!(owner.store.get(&id).await?.is_none());
+    assert!(!owner.sandboxes.read().await.contains_key(&id));
+    assert!(matches!(*progress.lock().await, DeleteProgress::Done));
+    Ok(())
+}
+
+// Gate the exact Delete/terminal-capture interleaving; no sleeps select it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_capture_concurrent_delete_does_not_hold_handoff_mutex() -> Result<()> {
+    for operation in [MockOperation::Pause, MockOperation::Snapshot] {
+        let behavior = Arc::new(MockBehavior::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        behavior.set_on_operation(
+            operation,
+            Arc::new({
+                let entered = entered.clone();
+                let release = release.clone();
+                move || {
+                    entered.notify_one();
+                    let (released, condition) = &*release;
+                    let (released, _) = condition
+                        .wait_timeout_while(
+                            released.lock().expect("capture release state"),
+                            Duration::from_secs(2),
+                            |released| !*released,
+                        )
+                        .expect("bounded capture release wait");
+                    assert!(
+                        *released,
+                        "capture hook release exceeded original two seconds"
+                    );
+                }
+            }),
+        );
+        behavior.push_action(
+            operation,
+            MockAction::FailTerminal {
+                message: "terminal gated capture".into(),
+            },
+        );
+        // Each concurrent caller performs one genuine failed Stop; neither can
+        // claim retirement. Only the later explicit third Stop may complete.
+        for _ in 0..2 {
+            behavior.push_action(
+                MockOperation::Stop,
+                MockAction::Fail {
+                    message: "original live backend".into(),
+                },
+            );
+        }
+        let control = Arc::new(ScriptedStoreControl::default());
+        let conflict = Arc::new(tokio::sync::Notify::new());
+        *control.capture_delete_conflict.lock().unwrap() = Some(conflict.clone());
+        let mut owner = make_orchestrator_without_background_with_factory(
+            ScriptedStore::new(control),
+            MockBackendFactory::with_behavior(behavior.clone()),
+        );
+        Arc::get_mut(&mut owner).unwrap().image_refs =
+            Arc::new(RecordingRuntimeImageRefs::default());
+        let id = SandboxId::new();
+        owner
+            .launch_sandbox(create_launch_plan_with_resources(id))
+            .await?;
+        let original = owner.sandboxes.read().await.get(&id).cloned().unwrap();
+        let capture = tokio::spawn({
+            let owner = owner.clone();
+            async move {
+                if operation == MockOperation::Pause {
+                    owner.pause_sandbox(id).await
+                } else {
+                    owner.capture_snapshot(id).await.map(|_| ())
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("capture entered original hook");
+        let delete = tokio::spawn({
+            let owner = owner.clone();
+            async move { owner.delete_sandbox(id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), conflict.notified())
+            .await
+            .expect("delete observed capture state conflict");
+        {
+            let (released, condition) = &*release;
+            *released.lock().expect("capture release state") = true;
+            condition.notify_all();
+        }
+        let (capture, delete) = tokio::time::timeout(Duration::from_secs(2), async {
+            (capture.await, delete.await)
+        })
+        .await
+        .expect("capture and delete completed without handoff mutex cycle");
+        assert!(capture.expect("capture task joined").is_err());
+        assert!(delete.expect("delete task joined").is_err());
+        let retained = owner.sandboxes.read().await.get(&id).cloned().unwrap();
+        assert!(Arc::ptr_eq(&retained, &original));
+        assert_eq!(
+            owner.store.get(&id).await?.unwrap().state,
+            SandboxState::Killing
+        );
+        assert_eq!(
+            owner.proxy_lookup_for(&id).await?,
+            ProxyLookupResult::Unavailable(SandboxState::Killing)
+        );
+        let progress = owner.deletions.lock().await.get(&id).cloned().unwrap();
+        assert!(matches!(
+            *progress.lock().await,
+            DeleteProgress::Stop {
+                capture_failed: true
+            }
+        ));
+        assert_eq!(behavior.stop_calls(), 2);
+        owner.delete_sandbox(id).await?;
+        assert_eq!(behavior.stop_calls(), 3);
+        assert!(owner.store.get(&id).await?.is_none());
+    }
     Ok(())
 }

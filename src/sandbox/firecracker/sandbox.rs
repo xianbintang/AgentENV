@@ -166,6 +166,42 @@ fn volume_drive_slot_id(index: usize) -> String {
 
 // ── FirecrackerSandbox ───────────────────────────────────────────────────────
 
+/// Original network obligation; absence of a slot is never history evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeNetworkObligation {
+    Unproven,
+    NeverAllocatedNativeTopology,
+    ReleaseUnknown,
+    Returned,
+}
+impl NativeNetworkObligation {
+    fn disposition(
+        self,
+        slot_present: bool,
+        release_unknown: bool,
+    ) -> Option<NativeNetworkDisposition> {
+        if slot_present || release_unknown {
+            return None;
+        }
+        match self {
+            Self::NeverAllocatedNativeTopology => Some(NativeNetworkDisposition::NotAllocated),
+            Self::Returned => Some(NativeNetworkDisposition::Returned),
+            Self::Unproven | Self::ReleaseUnknown => None,
+        }
+    }
+}
+/// Literal producer evidence, distinct from storage reclamation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeNetworkDisposition {
+    /// No original network discharge evidence is available.
+    #[default]
+    Unknown,
+    /// The original validated native topology never acquired a network slot.
+    NotAllocated,
+    /// The original owned slot was successfully returned to its manager.
+    Returned,
+}
 /// A Firecracker microVM-backed sandbox instance.
 ///
 /// Internal state is managed via the high-level lifecycle methods.
@@ -177,6 +213,7 @@ pub struct NativeExecutionStopped {
     id: SandboxId,
     profile: super::native_guest::NativeGuestProfile,
     network_returned: bool,
+    network_disposition: NativeNetworkDisposition,
 }
 impl NativeExecutionStopped {
     pub(crate) fn sandbox_id(&self) -> SandboxId {
@@ -184,6 +221,10 @@ impl NativeExecutionStopped {
     }
     pub(crate) fn profile(&self) -> &super::native_guest::NativeGuestProfile {
         &self.profile
+    }
+    /// The original native topology or a successful owned-slot release.
+    pub fn network_disposition(&self) -> NativeNetworkDisposition {
+        self.network_disposition
     }
     /// A network slot was returned to its manager; this is not namespace absence.
     pub fn network_returned(&self) -> bool {
@@ -219,6 +260,7 @@ pub struct FirecrackerSandbox {
     native_ready_observed: std::sync::OnceLock<()>,
     native_network_release_unknown: bool,
     native_network_returned: bool,
+    native_network_obligation: NativeNetworkObligation,
     rootfs_runtime: Option<OverlaybdRuntimeHandle>,
     mem_ublk_device: Option<SharedReadOnlyDevice>,
     startup_prefetch_task: Option<super::startup_pack::LocalStartupPrefetch>,
@@ -1614,11 +1656,13 @@ impl FirecrackerSandbox {
 
         // Cleanup network resources
         let mut network_error = None;
+        if self.launch.common().native_guest_profile.is_some() && self.network_slot.is_some() {
+            // Fence history before taking ownership out of the original object.
+            self.native_network_release_unknown = true;
+            self.native_network_obligation = NativeNetworkObligation::ReleaseUnknown;
+        }
         if let Some(slot) = self.network_slot.take() {
             let idx = slot.idx;
-            if self.launch.common().native_guest_profile.is_some() {
-                self.native_network_release_unknown = true;
-            }
             match NetworkManager::global()
                 .release(slot)
                 .context("Failed to release network slot")
@@ -1626,6 +1670,9 @@ impl FirecrackerSandbox {
                 Ok(()) => {
                     self.native_network_release_unknown = false;
                     self.native_network_returned = true;
+                    if self.launch.common().native_guest_profile.is_some() {
+                        self.native_network_obligation = NativeNetworkObligation::Returned;
+                    }
                     debug!(slot = idx, "network slot released");
                 }
                 Err(error) => network_error = Some(error),
@@ -1652,11 +1699,17 @@ impl FirecrackerSandbox {
             && !self.native_network_release_unknown
         {
             if let Some(profile) = &self.launch.common().native_guest_profile {
-                self.native_execution_stopped = Some(Arc::new(NativeExecutionStopped {
-                    id: self.id,
-                    profile: profile.clone(),
-                    network_returned: self.native_network_returned,
-                }));
+                if let Some(network_disposition) = self.native_network_obligation.disposition(
+                    self.network_slot.is_some(),
+                    self.native_network_release_unknown,
+                ) {
+                    self.native_execution_stopped = Some(Arc::new(NativeExecutionStopped {
+                        id: self.id,
+                        profile: profile.clone(),
+                        network_returned: self.native_network_returned,
+                        network_disposition,
+                    }));
+                }
             }
         }
         debug!("firecracker sandbox stopped");
@@ -1984,6 +2037,7 @@ impl FirecrackerSandbox {
             native_ready_observed: std::sync::OnceLock::new(),
             native_network_release_unknown: false,
             native_network_returned: false,
+            native_network_obligation: NativeNetworkObligation::Unproven,
             rootfs_runtime: None,
             startup_prefetch_task: None,
             mem_ublk_device: None,
@@ -2203,6 +2257,15 @@ impl FirecrackerSandbox {
             std::time::Instant::now() < *expiry,
             "native original Worker lease expired before claim"
         );
+        // This original path has no NetworkManager allocation or NIC. Stamp
+        // before claim/child creation, never infer this witness during Stop.
+        anyhow::ensure!(
+            self.network_slot.is_none()
+                && !self.native_network_release_unknown
+                && self.native_network_obligation == NativeNetworkObligation::Unproven,
+            "native network topology history changed"
+        );
+        self.native_network_obligation = NativeNetworkObligation::NeverAllocatedNativeTopology;
         profile.claim()?;
         self.native_inputs = Some(inputs);
         // A slow durable claim cannot renew permission to create the child.
@@ -2798,6 +2861,13 @@ impl FirecrackerSandbox {
         }
         self.configure_extra_drives(&volume_slots).await?;
 
+        anyhow::ensure!(
+            config.common.native_guest_profile.is_none()
+                || (self.network_slot.is_none()
+                    && self.native_network_obligation
+                        == NativeNetworkObligation::NeverAllocatedNativeTopology),
+            "native topology cannot acquire a NIC"
+        );
         if self.network_slot.is_some() {
             // Network interface.
             self.fc_instance
@@ -3511,6 +3581,14 @@ mod tests {
         // child or profile mutation. All subsequent entry points must refuse.
         sandbox.stop().await?;
         let sealed = sandbox.native_stop_started
+            && sandbox.native_network_obligation == NativeNetworkObligation::Unproven
+            && sandbox
+                .native_network_obligation
+                .disposition(
+                    sandbox.network_slot.is_some(),
+                    sandbox.native_network_release_unknown,
+                )
+                .is_none()
             && sandbox.native_execution_stopped.is_none()
             && sandbox.start_nowait().await.is_err()
             && sandbox.wait_for_ready().await.is_err()
@@ -4043,5 +4121,31 @@ mod tests {
             .to_string()
             .contains("ensure start() was called before pause() or snapshot"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod native_network_obligation_tests {
+    use super::{NativeNetworkDisposition as D, NativeNetworkObligation as O};
+    #[test]
+    fn original_network_history_not_current_none_controls_evidence() {
+        assert_eq!(O::Unproven.disposition(false, false), None);
+        assert_eq!(
+            O::NeverAllocatedNativeTopology.disposition(false, false),
+            Some(D::NotAllocated)
+        );
+        assert_eq!(
+            O::NeverAllocatedNativeTopology.disposition(true, false),
+            None
+        );
+        assert_eq!(
+            O::NeverAllocatedNativeTopology.disposition(false, true),
+            None
+        );
+        // Release took the slot but failed or was cancelled. None is no proof.
+        assert_eq!(O::ReleaseUnknown.disposition(false, false), None);
+        assert_eq!(O::ReleaseUnknown.disposition(false, true), None);
+        assert_eq!(O::Returned.disposition(false, false), Some(D::Returned));
+        assert_eq!(O::Returned.disposition(true, false), None);
     }
 }

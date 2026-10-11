@@ -276,6 +276,7 @@ fn query_failure(
 struct ExecutionReceipt {
     grant_sha256: String,
     network_returned: bool,
+    network_disposition: crate::sandbox::firecracker::NativeNetworkDisposition,
     persistent_artifacts_retained: bool,
 }
 #[derive(Serialize)]
@@ -908,6 +909,7 @@ impl Ingress {
                         r.execution = Some(ExecutionReceipt {
                             grant_sha256,
                             network_returned: stopped.network_returned(),
+                            network_disposition: stopped.network_disposition(),
                             persistent_artifacts_retained: stopped.persistent_artifacts_retained(),
                         });
                         if Instant::now() < stop_until {
@@ -967,7 +969,7 @@ impl Ingress {
                     project_status(wire.schema, r.status, r.stop_job.is_some()),
                     r.orchestration_failure.as_ref(),
                 ),
-                execution: if wire.schema == 2 && matches!(r.status, Status::ExecutionStopped) {
+                execution: if wire.schema == 5 && matches!(r.status, Status::ExecutionStopped) {
                     r.execution.as_ref()
                 } else {
                     None
@@ -1007,7 +1009,7 @@ fn missing_original_outcome(kind: Kind) -> Option<ConnectionOutcome> {
     }
 }
 // Schema 1 keeps the original closed Start/Query reply vocabulary. A stopped
-// original can never project Ready to an older reader. Schema 2 is explicitly
+// original can never project Ready to an older reader. Schema 5 is explicitly
 // negotiated by Stop or Query and alone carries the narrow execution receipt.
 fn project_status(schema: u32, status: Status, stopping: bool) -> Status {
     if matches!(schema, 1 | 4) && (stopping || matches!(status, Status::ExecutionStopped)) {
@@ -1021,7 +1023,7 @@ fn validate(w: &Wire, worker: &Worker, sdk: &str) -> Result<()> {
         matches!(
             (w.schema, w.kind),
             (1, Kind::Start | Kind::Query)
-                | (2, Kind::Stop | Kind::Query)
+                | (5, Kind::Stop | Kind::Query)
                 | (3, Kind::ExecutionQuery | Kind::ExecutionRead)
                 | (4, Kind::Query)
         ) && w.authority_epoch > 0
@@ -1360,19 +1362,21 @@ mod tests {
         assert!(validate(&wire(), &worker, "22222222-2222-2222-2222-222222222222").is_err());
     }
     #[test]
-    fn stop_requires_explicit_version_two_and_start_stays_version_one() {
+    fn stop_requires_explicit_version_five_and_start_stays_version_one() {
         let mut w = wire();
         let worker = w.original.context.target.clone();
         let sdk = w.original.server_incarnation.clone();
         w.kind = Kind::Stop;
         assert!(validate(&w, &worker, &sdk).is_err());
         w.schema = 2;
+        assert!(validate(&w, &worker, &sdk).is_err());
+        w.schema = 5;
         validate(&w, &worker, &sdk).unwrap();
         w.kind = Kind::Query;
         validate(&w, &worker, &sdk).unwrap();
         w.schema = 1;
         validate(&w, &worker, &sdk).unwrap();
-        w.schema = 2;
+        w.schema = 5;
         w.kind = Kind::Start;
         assert!(validate(&w, &worker, &sdk).is_err());
         w.schema = 3;
@@ -1489,13 +1493,15 @@ mod tests {
                 let stopped = ExecutionReceipt {
                     grant_sha256: "a".repeat(64),
                     network_returned: false,
+                    network_disposition:
+                        crate::sandbox::firecracker::NativeNetworkDisposition::NotAllocated,
                     persistent_artifacts_retained: true,
                 };
-                reply.schema = 2;
-                reply.status = project_status(2, r.status, true);
+                reply.schema = 5;
+                reply.status = project_status(5, r.status, true);
                 reply.execution = Some(&stopped);
                 reply.orchestration_failure =
-                    query_failure(2, reply.status, r.orchestration_failure.as_ref());
+                    query_failure(5, reply.status, r.orchestration_failure.as_ref());
                 let narrow: serde_json::Value =
                     serde_json::from_slice(&serde_json::to_vec(&reply).unwrap()).unwrap();
                 assert_eq!(narrow["status"], "execution_stopped");
@@ -1504,7 +1510,7 @@ mod tests {
                 assert!(narrow.get("orchestration_failure").is_none());
                 assert!(query_failure(
                     2,
-                    project_status(2, r.status, true),
+                    project_status(5, r.status, true),
                     r.orchestration_failure.as_ref()
                 )
                 .is_none());
@@ -1576,6 +1582,8 @@ mod tests {
         let receipt = ExecutionReceipt {
             grant_sha256: "a".repeat(64),
             network_returned: false,
+            network_disposition:
+                crate::sandbox::firecracker::NativeNetworkDisposition::NotAllocated,
             persistent_artifacts_retained: true,
         };
         for status in [
@@ -1610,19 +1618,19 @@ mod tests {
             assert_eq!(old.sandbox_id.as_deref(), Some("original-sandbox"));
             assert_eq!(old.authority_epoch, w.authority_epoch);
             assert_eq!(old.original_sha256, w.original_sha256);
-            reply.schema = 2;
+            reply.schema = 5;
             reply.status = Status::ExecutionStopped;
             reply.execution = Some(&receipt);
             let raw = serde_json::to_vec(&reply).unwrap();
             assert!(serde_json::from_slice::<LegacyReply>(&raw).is_err());
             let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-            assert_eq!(value["schema"], 2);
+            assert_eq!(value["schema"], 5);
             assert_eq!(value["status"], "execution_stopped");
             assert_eq!(value["execution"]["grant_sha256"], receipt.grant_sha256);
         }
         assert_eq!(project_status(1, Status::Ready, false), Status::Ready);
         assert_eq!(
-            project_status(2, Status::ExecutionStopped, true),
+            project_status(5, Status::ExecutionStopped, true),
             Status::ExecutionStopped
         );
     }

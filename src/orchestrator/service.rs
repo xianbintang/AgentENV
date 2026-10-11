@@ -1814,6 +1814,22 @@ where
         // Attempt to transition to Killing, retrying after waiting whenever we
         // find the sandbox in a transitional state.
         let previous_state = loop {
+            // A terminal capture can hand off Stop while we waited for its
+            // state transition. Re-read the phase under this same mutex.
+            match *progress {
+                DeleteProgress::Done => return Ok(()),
+                DeleteProgress::Capture => {}
+                _ => {
+                    return self
+                        .delete_sandbox_impl(
+                            sandbox_id,
+                            SandboxState::Killing,
+                            &mut progress,
+                            stop_until,
+                        )
+                        .await
+                }
+            }
             match self
                 .store
                 .update_state_if_state(
@@ -1856,9 +1872,15 @@ where
                             state = ?actual_state,
                             "sandbox in transitional state, waiting before deletion"
                         );
-                        match self.wait_for_transition(sandbox_id, actual_state).await {
+                        // The capture owner needs this mutex to publish its
+                        // closed Stop handoff. Never wait on its state while
+                        // preventing that handoff from completing.
+                        drop(progress);
+                        let transition = self.wait_for_transition(sandbox_id, actual_state).await;
+                        progress = deletion.lock().await;
+                        match transition {
                             Ok(_) => {
-                                // Transition finished; retry the Killing CAS.
+                                // Recheck the handed-off phase before the CAS.
                                 continue;
                             }
                             Err(OrchestratorError::SandboxNotFound(_)) => {
@@ -2290,20 +2312,14 @@ where
                 warn!(error = ?err, "failed to pause sandbox");
                 if err.is_terminal() {
                     // The handle was already detached from `self.sandboxes`
-                    // before `pause()`. Do not reinsert it here: the live
-                    // runtime may have been mutated and is no longer safe to
-                    // keep serving as a running sandbox.
-                    let stop_result = {
-                        let mut sandbox = handle.lock().await;
-                        sandbox.stop().await
-                    };
-                    if let Err(stop_err) = stop_result {
-                        warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
+                    // before `pause()`. Its runtime may have been mutated; retain
+                    // it only in the closed Killing/Stop cleanup phase.
+                    if let Err(stop_err) = self
+                        .retire_terminal_capture(sandbox_id, &handle, removed_proxy_route)
+                        .await
+                    {
+                        warn!(error = ?stop_err, "terminal pause cleanup retained for retry");
                     }
-                    if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                        self.finalize_terminal_volumes(&metadata).await;
-                    }
-                    self.store.remove(&sandbox_id).await?;
                 } else {
                     self.sandboxes.write().await.insert(sandbox_id, handle);
                     self.restore_proxy_route(sandbox_id, removed_proxy_route)
@@ -2591,8 +2607,52 @@ where
         Err(OrchestratorError::SandboxNotFound(sandbox_id))
     }
 
+    // The lifecycle caller is cancellation-safe. Install the SAME backend and
+    // resumable Stop phase before cleanup; failure must not drop the last owner
+    // or publish the failed capture as Paused/Running. Admission stays closed.
+    async fn retire_terminal_capture(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        removed_route: Option<ProxyRoute>,
+    ) -> Result<()> {
+        // Preserve only the original closed native observation route. The
+        // recoverable restore helper would reopen admission and is forbidden.
+        let mut sandboxes = self.sandboxes.write().await;
+        sandboxes.insert(sandbox_id, Arc::clone(handle));
+        if let Some(route) = removed_route.filter(|route| route.target().is_none()) {
+            let mut routes = self.proxy_routes.write().await;
+            if let Some(control) = route.native_control().cloned() {
+                control.close_admission();
+                routes.publish_control(sandbox_id, control, route.version());
+            } else {
+                routes.publish_native(sandbox_id, route.version());
+            }
+        }
+        drop(sandboxes);
+        let deletion = self.deletion_progress(sandbox_id).await;
+        let mut progress = deletion.lock().await;
+        if !matches!(*progress, DeleteProgress::Capture) {
+            return Err(OrchestratorError::InternalError(
+                "terminal capture cleanup already owned".into(),
+            ));
+        }
+        *progress = DeleteProgress::Stop {
+            capture_failed: true,
+        };
+        self.store
+            .update_state_if_state(
+                &sandbox_id,
+                SandboxState::Killing,
+                &[SandboxState::Pausing, SandboxState::Snapshotting],
+            )
+            .await?;
+        self.delete_sandbox_impl(sandbox_id, SandboxState::Killing, &mut progress, None)
+            .await
+    }
+
     async fn fail_snapshot_operation<T>(
-        &self,
+        self: &Arc<Self>,
         sandbox_id: SandboxId,
         handle: &SandboxHandle,
         error: SandboxCaptureError,
@@ -2600,18 +2660,17 @@ where
     ) -> Result<T> {
         warn!(?error, ?operation, "sandbox snapshot operation failed");
         if error.is_terminal() {
-            self.detach_sandbox_handle_and_route(&sandbox_id).await;
-            if let Err(stop_error) = handle.lock().await.stop().await {
+            let (_, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+            if let Err(stop_error) = self
+                .retire_terminal_capture(sandbox_id, handle, removed_route)
+                .await
+            {
                 warn!(
                     ?stop_error,
                     ?operation,
-                    "failed to stop sandbox after terminal snapshot failure"
+                    "terminal snapshot cleanup retained for retry"
                 );
             }
-            if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                self.finalize_terminal_volumes(&metadata).await;
-            }
-            self.store.remove(&sandbox_id).await?;
         } else {
             let _ = self
                 .store
