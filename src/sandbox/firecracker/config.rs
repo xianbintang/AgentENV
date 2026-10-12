@@ -110,6 +110,9 @@ impl FirecrackerRuntimePolicy {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FirecrackerCommonConfig {
+    /// Explicit native launch identity; snapshots are refused until qualified.
+    #[serde(default)]
+    pub native_guest_profile: Option<super::native_guest::NativeGuestProfile>,
     pub firecracker_binary: PathBuf,
     /// Immutable release version of the complete tools drive.
     #[serde(default)]
@@ -187,6 +190,7 @@ impl FirecrackerCommonConfig {
     ) -> Self {
         Self {
             firecracker_binary,
+            native_guest_profile: None,
             tools_drive_version,
             firecracker_work_base_dir: None,
             serial_output_base_dir: None,
@@ -217,11 +221,23 @@ impl FirecrackerCommonConfig {
     }
 
     pub fn from_app_config(config: &AppConfig) -> Result<Self> {
+        let profile = config
+            .firecracker
+            .native_guest_profile
+            .as_deref()
+            .map(super::native_guest::NativeGuestProfile::load)
+            .transpose()?;
+        Self::from_app_config_selected_native(config, profile)
+    }
+    pub(crate) fn from_app_config_selected_native(
+        config: &AppConfig,
+        profile: Option<super::native_guest::NativeGuestProfile>,
+    ) -> Result<Self> {
         let runtime_policy = FirecrackerRuntimePolicy::from_app_config(config);
         let firecracker_binary = config.resolved_firecracker_binary_path();
         let tools_drive_version = config.resolved_tools_version().to_string();
-
         let mut common = Self::new(firecracker_binary, tools_drive_version, runtime_policy);
+        common.native_guest_profile = profile;
         common.envd_version = config.envd.version.clone();
         common.disk_rate_limit = config.machine.disk_rate_limit.clone();
         common.track_dirty_pages = config.memory_snapshot.track_dirty_pages;
@@ -244,7 +260,45 @@ impl FirecrackerCommonConfig {
         Self::from_app_config(ConfigManager::global_config())
     }
 
+    fn validate_native_options(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.rootfs_image_config.is_none()
+                && self.ublk_config.is_none()
+                && self.rootfs_virtual_size.is_none()
+                && self.extra_drives.is_empty(),
+            "native root/drive customization is unsupported"
+        );
+        anyhow::ensure!(
+            self.default_user.as_deref() == Some("1000")
+                && self.default_workdir.as_deref() == Some("/workspace")
+                && self.env_vars.as_ref().is_none_or(HashMap::is_empty),
+            "native context must be canonical UID1000/workspace without environment"
+        );
+        anyhow::ensure!(
+            self.network_policy
+                .as_ref()
+                .is_none_or(|p| *p == crate::sandbox::SandboxNetworkPolicy::default())
+                && self.mmds_metadata.is_none()
+                && self.envd_access_token.is_none()
+                && self.custom_extension_params.is_none()
+                && self.cpu_config_json.is_none(),
+            "native network/MMDS/extension/CPU customization is unsupported"
+        );
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if let Some(profile) = &self.native_guest_profile {
+            if !cfg!(target_os = "linux") || !self.firecracker_binary.is_file() {
+                anyhow::bail!("native guest requires Linux and an installed VMM");
+            }
+            profile.validate()?;
+            if self.firecracker_binary != profile.vmm_executable {
+                anyhow::bail!("native VMM must match the protected profile executable");
+            }
+            self.validate_native_options()?;
+            return Ok(());
+        }
         let config = ConfigManager::global_config();
         self.resolved_tools_drive_path(config)?;
         if !cfg!(target_os = "linux") {
@@ -314,7 +368,33 @@ pub(super) fn logging_enabled(log_level: Option<&str>) -> bool {
     log_level.is_some_and(|level| !level.trim().is_empty())
 }
 
-pub(crate) fn create_firecracker_work_dir(work_dir: Option<&Path>) -> Result<TempDir> {
+pub(crate) fn create_firecracker_work_dir(
+    work_dir: Option<&Path>,
+    native: bool,
+) -> Result<TempDir> {
+    if native {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut builder = tempfile::Builder::new();
+            builder.prefix("agentenv-fc-");
+            // Supply the restrictive mode to mkdir itself, before any launch
+            // resource exists. No chmod interval with a public native parent.
+            builder.permissions(fs::Permissions::from_mode(0o700));
+            return match work_dir {
+                Some(parent) => {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("create firecracker work_dir {}", parent.display())
+                    })?;
+                    builder.tempdir_in(parent)
+                }
+                None => builder.tempdir(),
+            }
+            .context("create private native firecracker work directory");
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("native private work directory requires Unix");
+    }
     match work_dir {
         Some(parent) => {
             fs::create_dir_all(parent)
@@ -381,6 +461,26 @@ impl FirecrackerSandboxConfig {
         user_image_config.runtime_upper_mode = runtime_upper_mode;
 
         let mut common = FirecrackerCommonConfig::from_app_config(config)?;
+        if let Some(profile) = &common.native_guest_profile {
+            anyhow::ensure!(
+                user_image_config.image_config_path == profile.rootfs_path
+                    && !user_image_config.read_only,
+                "native source must select the exact protected profile root artifact"
+            );
+            anyhow::ensure!(
+                config.firecracker.boot_args.is_none(),
+                "native boot customization is unsupported"
+            );
+            common.default_workdir = Some("/workspace".into());
+            common.default_user = Some("1000".into());
+            return Ok(Self {
+                kernel_image: profile.kernel_path.clone(),
+                common,
+                boot_args: None,
+                vcpu_count: config.machine.vcpu_count,
+                mem_size_mib: config.machine.mem_size_mib,
+            });
+        }
         common.rootfs_image_config = Some(user_image_config.clone());
         common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
             user_image_config.image_config_path.clone(),
@@ -427,6 +527,16 @@ impl FirecrackerSandboxConfig {
 
     pub fn validate(&self) -> Result<()> {
         self.common.validate()?;
+        if let Some(profile) = &self.common.native_guest_profile {
+            anyhow::ensure!(
+                self.kernel_image == profile.kernel_path
+                    && self.boot_args.is_none()
+                    && self.vcpu_count == 1
+                    && (128..=512).contains(&self.mem_size_mib),
+                "native kernel/boot/CPU/memory bounds refused"
+            );
+            return Ok(());
+        }
         if !self.kernel_image.exists() {
             anyhow::bail!("kernel image not found at {}", self.kernel_image.display());
         }
@@ -579,6 +689,9 @@ impl FirecrackerSnapshotConfig {
     }
 
     fn validate_persisted_artifacts(&self) -> Result<()> {
+        if self.common.native_guest_profile.is_some() {
+            anyhow::bail!("native snapshot identity is unqualified");
+        }
         let rootfs_virtual_size = self
             .common
             .rootfs_virtual_size
@@ -681,6 +794,38 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn native_work_directory_is_private_at_creation_and_legacy_mode_is_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempdir().unwrap();
+        let native = create_firecracker_work_dir(Some(parent.path()), true).unwrap();
+        let legacy = create_firecracker_work_dir(Some(parent.path()), false).unwrap();
+        let original_legacy = TempDir::with_prefix_in("agentenv-fc-", parent.path()).unwrap();
+        let native_mode = fs::symlink_metadata(native.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let legacy_mode = fs::symlink_metadata(legacy.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let original_mode = fs::symlink_metadata(original_legacy.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let native_path = native.path().to_owned();
+        drop(native);
+        drop(legacy);
+        drop(original_legacy);
+        assert_eq!(native_mode, 0o700);
+        assert_eq!(legacy_mode, original_mode);
+        assert!(!native_path.exists());
+    }
 
     struct CurrentDirGuard(PathBuf);
 

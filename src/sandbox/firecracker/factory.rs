@@ -22,18 +22,32 @@ use crate::types::SandboxId;
 
 pub struct FirecrackerSandboxFactory {
     cpu_config_arc: Option<Arc<RwLock<Option<String>>>>,
+    #[cfg(test)]
+    qualification_delegate: Option<Arc<dyn SandboxBackendFactory>>,
 }
 
 impl FirecrackerSandboxFactory {
     pub fn new() -> Self {
         Self {
             cpu_config_arc: None,
+            #[cfg(test)]
+            qualification_delegate: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_qualification_delegate(delegate: Arc<dyn SandboxBackendFactory>) -> Self {
+        Self {
+            cpu_config_arc: None,
+            qualification_delegate: Some(delegate),
         }
     }
 
     pub fn with_cpu_config(arc: Arc<RwLock<Option<String>>>) -> Self {
         Self {
             cpu_config_arc: Some(arc),
+            #[cfg(test)]
+            qualification_delegate: None,
         }
     }
 }
@@ -74,19 +88,124 @@ fn is_allowed_extra_boot_arg(arg: &str, allowed_prefixes: &[String]) -> bool {
         .any(|prefix| arg.starts_with(prefix))
 }
 
+pub(super) fn validate_native_request(
+    profile: &super::native_guest::NativeGuestProfile,
+    build: &FreshSandboxBuildSpec,
+    launch: &SandboxLaunchConfig,
+) -> Result<()> {
+    anyhow::ensure!(
+        build.image_config_path == profile.rootfs_path
+            && launch.snapshot_id == profile.rootfs_sha256,
+        "native source path/SHA must match the protected profile"
+    );
+    anyhow::ensure!(
+        build.resources.cpu_count == 1
+            && (128..=512).contains(&build.resources.memory_mib)
+            && build.resources.disk_size_mib == 0
+            && build.extra_drives.is_empty()
+            && build.extra_boot_args.is_none(),
+        "native resource/drive/boot request refused"
+    );
+    let context = &build.context;
+    anyhow::ensure!(
+        context.user.as_deref() == Some("1000")
+            && context.workdir == "/workspace"
+            && context.env_vars.is_empty()
+            && context.exposed_ports.is_empty()
+            && context.entrypoint.is_none()
+            && context.cmd.is_none()
+            && context.volumes.is_empty()
+            && context.labels.is_empty(),
+        "native source context must be canonical UID1000/workspace"
+    );
+    anyhow::ensure!(
+        launch
+            .env_vars
+            .as_ref()
+            .is_none_or(std::collections::HashMap::is_empty)
+            && launch
+                .network
+                .as_ref()
+                .is_none_or(|p| *p == crate::sandbox::SandboxNetworkPolicy::default())
+            && launch.extra_mmds.is_empty()
+            && launch.custom_extension_params.is_none()
+            && launch.envd_access_token.is_none(),
+        "native launch environment/network/MMDS/extension request refused"
+    );
+    Ok(())
+}
+
 impl SandboxBackendFactory for FirecrackerSandboxFactory {
+    fn build_native_original(
+        &self,
+        promotion: &crate::sandbox::NativeProfilePromotion,
+    ) -> Result<Box<dyn SandboxBackend>> {
+        let app = ConfigManager::global_config();
+        anyhow::ensure!(
+            app.is_native_root()
+                && app.firecracker.boot_args.is_none()
+                && self
+                    .cpu_config_arc
+                    .as_ref()
+                    .is_none_or(|arc| arc.read().expect("CPU config").is_none()),
+            "native original factory policy refused"
+        );
+        let mut common = super::config::FirecrackerCommonConfig::from_app_config_selected_native(
+            app,
+            Some(promotion.profile.clone()),
+        )?;
+        common.default_workdir = Some("/workspace".into());
+        common.default_user = Some("1000".into());
+        let config = FirecrackerSandboxConfig {
+            kernel_image: promotion.profile.kernel_path.clone(),
+            common,
+            boot_args: None,
+            vcpu_count: 1,
+            mem_size_mib: promotion.memory_mib,
+        };
+        config.validate()?;
+        Ok(Box::new(FirecrackerSandbox::new_native_original(
+            config,
+            promotion.sandbox_id,
+            promotion.expires,
+        )?))
+    }
+
     fn build(
         &self,
         build_spec: FreshSandboxBuildSpec,
         launch_config: SandboxLaunchConfig,
     ) -> Result<Box<dyn SandboxBackend>> {
+        #[cfg(test)]
+        if let Some(delegate) = &self.qualification_delegate {
+            return delegate.build(build_spec, launch_config);
+        }
         let user_image_config = OverlaybdConfig {
-            image_config_path: build_spec.image_config_path,
+            image_config_path: build_spec.image_config_path.clone(),
             read_only: false,
             runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
         };
         let mut config =
             FirecrackerSandboxConfig::from_global_config_with_user_image(user_image_config)?;
+        if let Some(profile) = &config.common.native_guest_profile {
+            validate_native_request(profile, &build_spec, &launch_config)?;
+            anyhow::ensure!(
+                self.cpu_config_arc
+                    .as_ref()
+                    .is_none_or(|arc| arc.read().expect("CPU config").is_none()),
+                "native CPU customization is unsupported"
+            );
+            config.vcpu_count = build_spec.resources.cpu_count;
+            config.mem_size_mib = build_spec.resources.memory_mib;
+            // Native protocol/config binding owns identity; this guest does not
+            // consume legacy MMDS. Caller extras were refused above, while the
+            // normal orchestrator still retains SandboxId/source metadata.
+            config.validate()?;
+            return Ok(Box::new(FirecrackerSandbox::new_with_id(
+                config,
+                launch_config.sandbox_id,
+            )?));
+        }
         let (rootfs_image_config_path, rootfs_read_only, runtime_upper_mode) = {
             let rootfs_image_config = config
                 .common

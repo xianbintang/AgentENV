@@ -1,3 +1,6 @@
+/// Send future returned by generated object-safe API declarations.
+pub type ApiFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
 pub mod admin;
 pub mod default;
 pub mod sandboxes;
@@ -11,11 +14,16 @@ pub trait ApiKeyAuthHeader {
     type Claims;
 
     /// Extracting Claims from Header. Return None if the Claims are invalid.
-    async fn extract_claims_from_header(
-        &self,
-        headers: &axum::http::header::HeaderMap,
-        key: &str,
-    ) -> Option<Self::Claims>;
+    fn extract_claims_from_header<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        headers: &'life1 axum::http::header::HeaderMap,
+        key: &'life2 str,
+    ) -> ApiFuture<'async_trait, Option<Self::Claims>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -32,12 +40,17 @@ pub trait ApiAuthBasic {
     type Claims;
 
     /// Extracting Claims from Header. Return None if the Claims are invalid.
-    async fn extract_claims_from_auth_header(
-        &self,
+    fn extract_claims_from_auth_header<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
         kind: BasicAuthKind,
-        headers: &axum::http::header::HeaderMap,
-        key: &str,
-    ) -> Option<Self::Claims>;
+        headers: &'life1 axum::http::header::HeaderMap,
+        key: &'life2 str,
+    ) -> ApiFuture<'async_trait, Option<Self::Claims>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait;
 }
 
 // Error handler for unhandled errors.

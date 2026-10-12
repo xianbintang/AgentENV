@@ -31,6 +31,7 @@ for directive in \
   'RuntimeDirectory=aenv' \
   'AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN' \
   'CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN' \
+  'SecureBits=noroot noroot-locked' \
   'NoNewPrivileges=true'; do
   grep -Fqx "$directive" "$unit_file"
 done

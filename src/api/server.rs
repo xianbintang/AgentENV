@@ -38,7 +38,12 @@ where
         .route_layer(middleware::from_fn(sandbox_logs_cursor))
         .merge(proxy::router(api_impl.clone()))
         .merge(super::impls::image_build::router(api_impl.clone()))
+        .merge(super::native_control::router(api_impl.clone()))
         .route("/metrics", get(metrics_handler))
+        .layer(middleware::from_fn_with_state(
+            crate::cfg::ConfigManager::global_config().is_native_root(),
+            native_deployment_routes,
+        ))
         .layer(middleware::from_fn_with_state(
             api_impl.clone(),
             proxy::sandbox_proxy_classifier::<I>,
@@ -106,6 +111,24 @@ async fn optional_connect_body(request: Request, next: Next) -> Response {
         Body::from(bytes)
     };
     next.run(Request::from_parts(parts, body)).await
+}
+
+async fn native_deployment_routes(
+    axum::extract::State(native): axum::extract::State<bool>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if native
+        && !crate::native_deployment::route_allowed(request.method().as_str(), request.uri().path())
+    {
+        return (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            axum::Json(serde_json::json!({"error":"unsupported_native_deployment_operation"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 #[cfg(test)]

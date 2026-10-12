@@ -959,7 +959,7 @@ mod tests {
     use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
 
     async fn manager_at(root: &Path) -> VolumeManager {
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+        let backend = PosixFsBackend::new_owned_fixture(PosixFsBackendConfig {
             root: root.join("repository"),
             cache_root: Some(root.join("cache")),
             runtime_cache_root: Some(root.join("runtime")),

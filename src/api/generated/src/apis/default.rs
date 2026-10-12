@@ -25,11 +25,17 @@ pub trait Default<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::Error
     /// Health check.
     ///
     /// HealthGet - GET /health
-    async fn health_get(
-        &self,
+    fn health_get<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-    ) -> Result<HealthGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+    ) -> super::ApiFuture<'async_trait, Result<HealthGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait;
 }

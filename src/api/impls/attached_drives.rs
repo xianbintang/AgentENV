@@ -166,7 +166,10 @@ mod tests {
             deps_path: temp.path().join("deps"),
             ..AppConfig::default()
         };
-        ImageResolver::new(&config)
+        ImageResolver::with_store(
+            &config,
+            crate::image::cache::test_support::owned_real_image_services().source_images,
+        )
     }
 
     fn drive(

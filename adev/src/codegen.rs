@@ -22,6 +22,12 @@ pub enum CodegenTarget {
     Envd,
     /// Regenerate AENV HTTP server stubs
     Server,
+    /// Normalize existing AENV server signatures offline, without running codegen.
+    ServerNormalize {
+        /// Refuse stale signatures without writing any files.
+        #[arg(long)]
+        check: bool,
+    },
     /// Regenerate custom extension HTTP client
     CustomExtension,
 }
@@ -45,6 +51,9 @@ pub fn run(args: CodegenArgs) -> Result<()> {
         Some(CodegenTarget::Firecracker) => run_firecracker(&project_root),
         Some(CodegenTarget::Envd) => run_envd(&project_root),
         Some(CodegenTarget::Server) => run_server(&project_root),
+        Some(CodegenTarget::ServerNormalize { check }) => {
+            normalize_server_apis(&project_root.join("src/api/generated"), check)
+        }
         Some(CodegenTarget::CustomExtension) => run_custom_extension(&project_root),
         None => {
             run_firecracker(&project_root)?;
@@ -171,6 +180,7 @@ fn run_server(project_root: &std::path::Path) -> Result<()> {
     // Port of fix_rust_axum_duplicate_auth_trait.py
     let mod_rs = server_dir.join("src/apis/mod.rs");
     fix_duplicate_auth_trait(&mod_rs)?;
+    normalize_server_apis(&server_dir, false)?;
 
     util::cmd("cargo", &["fmt", "-p", "agentenv_http_server"])?;
     util::info("AENV server generated.");
@@ -239,4 +249,217 @@ fn fix_duplicate_auth_trait(path: &std::path::Path) -> Result<()> {
         path.display()
     ));
     Ok(())
+}
+
+const API_FUTURE_ALIAS: &str = "/// Send future returned by generated object-safe API declarations.\npub type ApiFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;\n\n";
+const SERVER_API_FILES: [&str; 6] = [
+    "admin",
+    "default",
+    "sandboxes",
+    "snapshots",
+    "templates",
+    "mod",
+];
+
+/// Normalize only the pinned generator's abstract API methods. Implementations
+/// and the tracing-instrumented ErrorHandler default remain untouched.
+fn normalize_api_source(content: &str, authentication_module: bool) -> Result<String> {
+    use std::sync::LazyLock;
+    static START: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?m)^[ \t]*(?:unsafe[ \t]+)?async[ \t]+(?:unsafe[ \t]+)?fn[ \t]+([A-Za-z_][A-Za-z0-9_]*)\b",
+        )
+        .unwrap()
+    });
+    static SIGNATURE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?s)^    async fn ([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*->\s*([^;{]+)([;{])",
+        )
+        .unwrap()
+    });
+    static ARGUMENTS: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^[A-Za-z0-9_:,\s&<>\[\]]+$").unwrap());
+    static RETURN: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^[A-Za-z0-9_:,\s<>\[\]]+$").unwrap());
+    let mut edits = Vec::new();
+    for method in START.find_iter(content) {
+        let signature = SIGNATURE
+            .captures(&content[method.start()..])
+            .ok_or_else(|| anyhow::anyhow!("unsupported generated API method syntax"))?;
+        let name = &signature[1];
+        if &signature[4] == "{" {
+            if !authentication_module
+                || name != "handle_error"
+                || !content[..method.start()]
+                    .trim_end()
+                    .ends_with("#[tracing::instrument(skip_all)]")
+            {
+                anyhow::bail!("unsupported generated API default method");
+            }
+            continue;
+        }
+        let args = &signature[2];
+        let returned = signature[3].trim();
+        if !ARGUMENTS.is_match(args)
+            || !RETURN.is_match(returned)
+            || !args.trim_start().starts_with("&self,")
+            || args
+                .split_whitespace()
+                .any(|word| matches!(word, "dyn" | "impl" | "fn" | "where"))
+            || returned
+                .split_whitespace()
+                .any(|word| matches!(word, "dyn" | "impl" | "fn" | "where"))
+        {
+            anyhow::bail!("unsupported generated API signature types");
+        }
+        let mut borrowed = String::new();
+        let mut lifetimes = Vec::new();
+        for character in args.chars() {
+            if character == '&' {
+                let lifetime = format!("'life{}", lifetimes.len());
+                borrowed.push('&');
+                borrowed.push_str(&lifetime);
+                borrowed.push(' ');
+                lifetimes.push(lifetime);
+            } else {
+                borrowed.push(character);
+            }
+        }
+        let mut generics = lifetimes.clone();
+        generics.push("'async_trait".into());
+        let alias = if authentication_module {
+            "ApiFuture"
+        } else {
+            "super::ApiFuture"
+        };
+        let mut normalized = format!(
+            "    fn {name}<{}>({borrowed}) -> {alias}<'async_trait, {returned}>\n    where\n",
+            generics.join(", ")
+        );
+        for lifetime in lifetimes {
+            normalized.push_str(&format!("        {lifetime}: 'async_trait,\n"));
+        }
+        normalized.push_str("        Self: 'async_trait;");
+        edits.push((
+            method.start(),
+            method.start() + signature.get(0).unwrap().end(),
+            normalized,
+        ));
+    }
+    let mut result = content.to_owned();
+    for (start, end, replacement) in edits.into_iter().rev() {
+        result.replace_range(start..end, &replacement);
+    }
+    if authentication_module && !result.contains("pub type ApiFuture<") {
+        result.insert_str(0, API_FUTURE_ALIAS);
+    }
+    Ok(result)
+}
+
+fn normalize_server_apis(server_dir: &std::path::Path, check: bool) -> Result<()> {
+    // Parse every file before any write: unsupported generator output leaves the
+    // entire generated tree unchanged. Check mode performs no writes or tools.
+    let mut changes = Vec::new();
+    for name in SERVER_API_FILES {
+        let path = server_dir.join(format!("src/apis/{name}.rs"));
+        let content = std::fs::read_to_string(&path)?;
+        let normalized = normalize_api_source(&content, name == "mod")?;
+        if normalized != content {
+            changes.push((path, normalized));
+        }
+    }
+    if check && !changes.is_empty() {
+        anyhow::bail!("generated API future signatures require offline normalization");
+    }
+    for (path, normalized) in changes {
+        std::fs::write(path, normalized)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod future_normalization_tests {
+    use super::*;
+    #[test]
+    fn abstract_api_normalization_preserves_separate_borrows_and_generic_result() {
+        let input = "#[async_trait]\npub trait Api<E: Send + Sync + 'static>: super::ErrorHandler<E> {\n    async fn get(\n        &self,\n        claims: &Self::Claims,\n        names: &[&str],\n    ) -> Result<Response, E>;\n}\n";
+        let result = normalize_api_source(input, false).unwrap();
+        assert!(result.contains("fn get<'life0, 'life1, 'life2, 'life3, 'async_trait>"));
+        assert!(result.contains("claims: &'life1 Self::Claims"));
+        assert!(result.contains("names: &'life2 [&'life3 str]"));
+        assert!(result.contains("super::ApiFuture<'async_trait, Result<Response, E>>"));
+        assert!(result.contains("pub trait Api<E: Send + Sync + 'static>: super::ErrorHandler<E>"));
+        for n in 0..4 {
+            assert!(result.contains(&format!("'life{n}: 'async_trait")));
+        }
+        assert_eq!(normalize_api_source(&result, false).unwrap(), result);
+    }
+    #[test]
+    fn authentication_normalization_preserves_tracing_default_and_is_idempotent() {
+        let input = "#[async_trait::async_trait]\npub trait Auth {\n    type Claims;\n    async fn extract(\n        &self,\n        headers: &HeaderMap,\n        key: &str,\n    ) -> Option<Self::Claims>;\n}\n#[async_trait::async_trait]\npub trait ErrorHandler<E: Send + Sync + 'static> {\n    #[allow(unused_variables)]\n    #[tracing::instrument(skip_all)]\n    async fn handle_error(&self, error: E) -> Result<Response, StatusCode> {\n        tracing::error!(\"error: {:?}\", error);\n        response()\n    }\n}\n";
+        let result = normalize_api_source(input, true).unwrap();
+        assert!(result.starts_with(API_FUTURE_ALIAS));
+        assert!(result.contains("ApiFuture<'async_trait, Option<Self::Claims>>"));
+        let default = input
+            .split("#[async_trait::async_trait]\npub trait ErrorHandler")
+            .nth(1)
+            .unwrap();
+        assert!(result.ends_with(default));
+        assert_eq!(normalize_api_source(&result, true).unwrap(), result);
+    }
+    #[test]
+    fn unsupported_generator_signatures_and_defaults_refuse() {
+        for input in [
+            "    async fn get<T>(&self, arg: &T) -> Result<Response, E>;",
+            "  async fn get(&self, arg: &str) -> Result<Response, E>;",
+            "    unsafe async fn get(&self, arg: &str) -> Result<Response, E>;",
+            "    async unsafe fn get(&self, arg: &str) -> Result<Response, E>;",
+            "    async fn get(&self, arg: &'a str) -> Result<Response, E>;",
+            "    async fn get(&self, arg: impl Send) -> Result<Response, E>;",
+            "    async fn get(&self) -> Result<Response, E> where Self: Sync;",
+            "    async fn get(&self, arg: &str) -> Result<Response, E> { response() }",
+        ] {
+            assert!(normalize_api_source(input, false).is_err());
+        }
+    }
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn offline_check_and_unsupported_later_file_never_write_earlier_files() {
+        let path = std::env::temp_dir().join(format!(
+            "adev-api-futures-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let scratch = Scratch(path);
+        std::fs::create_dir_all(scratch.0.join("src/apis")).unwrap();
+        let original =
+            "pub trait Api {\n    async fn get(&self, key: &str) -> Result<Response, E>;\n}\n";
+        for name in SERVER_API_FILES {
+            std::fs::write(scratch.0.join(format!("src/apis/{name}.rs")), original).unwrap();
+        }
+        assert!(normalize_server_apis(&scratch.0, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(scratch.0.join("src/apis/admin.rs")).unwrap(),
+            original
+        );
+        let unsupported = "pub trait Api {\n    async unsafe fn get(&self, key: &str) -> Result<Response, E>;\n}\n";
+        std::fs::write(scratch.0.join("src/apis/templates.rs"), unsupported).unwrap();
+        assert!(normalize_server_apis(&scratch.0, false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(scratch.0.join("src/apis/admin.rs")).unwrap(),
+            original
+        );
+        std::fs::write(scratch.0.join("src/apis/templates.rs"), original).unwrap();
+        normalize_server_apis(&scratch.0, false).unwrap();
+        normalize_server_apis(&scratch.0, true).unwrap();
+    }
 }

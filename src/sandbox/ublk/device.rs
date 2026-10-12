@@ -178,8 +178,8 @@ fn runtime_device_timeout(resize_timeout_secs: u64) -> Duration {
 /// `image_config` path. Multiple sandboxes using the same memory snapshot
 /// image share a single read-only ublk device (and thus the same page cache).
 ///
-/// Initialized once via [`init_global`] (which spawns the daemon if
-/// configured). Accessed everywhere else via [`global`].
+/// Initialized once via [`Self::init_global`] (which spawns the daemon if
+/// configured). Accessed everywhere else via [`Self::global`].
 pub struct UblkDeviceManager {
     client: Option<Arc<UblkDaemonClient>>,
     pool_enabled: bool,
@@ -249,7 +249,7 @@ impl UblkDeviceManager {
             .await;
     }
 
-    /// Convenience: resolve daemon config from [`AppConfig`] and initialize.
+    /// Convenience: resolve daemon config from [`crate::cfg::AppConfig`] and initialize.
     ///
     /// Returns an error if the daemon binary cannot be found.
     pub async fn init_global_from_config(config: &crate::cfg::AppConfig) -> Result<()> {
@@ -270,7 +270,7 @@ impl UblkDeviceManager {
 
     /// Get the global manager instance.
     ///
-    /// Panics if [`init_global`] has not been called.
+    /// Panics if [`Self::init_global`] has not been called.
     pub fn global() -> &'static Self {
         GLOBAL_MANAGER
             .get()

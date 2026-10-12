@@ -83,6 +83,9 @@ pub(crate) struct ImageCacheService {
     metadata_store: OnceCell<ImageCacheMetadataStore>,
     source_images: Arc<SourceImageCache>,
     p2p_transport: OnceLock<Arc<dyn P2pTransport>>,
+    // Declared last: close metadata and source handles before removing owned test files.
+    #[cfg(test)]
+    test_owner: Option<tempfile::TempDir>,
 }
 
 impl fmt::Debug for ImageCacheService {
@@ -129,6 +132,8 @@ impl ImageCacheService {
             metadata_store: OnceCell::new(),
             source_images: Arc::new(SourceImageCache::default()),
             p2p_transport: OnceLock::new(),
+            #[cfg(test)]
+            test_owner: None,
         }
     }
 
@@ -137,6 +142,22 @@ impl ImageCacheService {
             self.p2p_transport.set(transport).is_ok(),
             "image cache P2P transport already initialized"
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owned_test_service() -> Arc<Self> {
+        let owner = tempfile::tempdir().expect("owned real image cache");
+        let root_dir = owner.path().join("image-cache");
+        let mut service = Self::from_resolved_config(ResolvedImageCacheConfig {
+            commit_store: root_dir.join("commits"),
+            remote_blocks_dir: root_dir.join("remote-blocks"),
+            root_dir,
+            remote_blocks_size_gb: 10,
+            capacity_bytes: None,
+            open_evict_idle_secs: 600,
+        });
+        service.test_owner = Some(owner);
+        Arc::new(service)
     }
 
     /// Compute the `(config, metadata)` sidecar paths for a source image
@@ -1566,6 +1587,37 @@ mod tests {
     use crate::image::ImageBaseContext;
     use crate::p2p::mock::MockTransport;
     use crate::p2p::{DisabledP2pTransport, P2pArtifactDescriptor, P2pArtifactProvider};
+
+    #[tokio::test]
+    async fn owned_test_cache_closes_database_before_removing_last_port_owner() {
+        let service = ImageCacheService::owned_test_service();
+        let root = service.test_owner.as_ref().unwrap().path().to_path_buf();
+        service
+            .metadata_store()
+            .await
+            .expect("real metadata database");
+        assert!(root.join("image-cache/metadata/CURRENT").is_file());
+        let ports = super::super::store::test_local_image_services_from_service(
+            Arc::clone(&service),
+            None,
+            Duration::from_secs(0),
+        );
+        let last = Arc::clone(&ports.runtime_refs);
+        drop(service);
+        drop(ports);
+        assert!(
+            root.exists(),
+            "remaining real cache port owns its directory"
+        );
+        last.reconcile_paused(&[])
+            .await
+            .expect("real startup reconcile");
+        drop(last);
+        assert!(
+            !root.exists(),
+            "last port closes DB before owned directory cleanup"
+        );
+    }
 
     fn test_service(temp: &TempDir) -> ImageCacheService {
         let root_dir = temp.path().join("image-cache");

@@ -747,12 +747,12 @@ mod tests {
         NetworkManager::new(false, capacity, capacity)
     }
 
-    fn test_slot(idx: u32) -> Slot {
+    fn test_slot(manager: &NetworkManager, idx: u32) -> Slot {
         Slot::new(
             idx,
             NetworkAddressPlan::default(),
-            std::env::temp_dir().join("aenv-network-tests/netns"),
-            EgressProxy::new(),
+            manager.netns_dir.clone(),
+            Arc::clone(&manager.egress_proxy),
         )
         .unwrap()
     }
@@ -972,7 +972,7 @@ mod tests {
         let manager = NetworkManager::new(true, 0, 2);
         for idx in 1..=4u32 {
             manager.allocated.insert(idx as usize);
-            manager.pool.release(test_slot(idx)).unwrap();
+            manager.pool.release(test_slot(&manager, idx)).unwrap();
         }
 
         manager.run_pool_maintenance_cycle().unwrap();
@@ -990,25 +990,44 @@ mod tests {
         let n = 200;
         // Pre-populate the pool so allocate_any() always uses the fast path (no create_network).
         let manager = Arc::new(manager_with_capacity(n));
+        let proxy_baseline = Arc::strong_count(&manager.egress_proxy);
         for idx in 1..=(n as u32) {
             manager.allocated.insert(idx as usize);
-            manager.pool.try_push_bounded(test_slot(idx)).unwrap();
+            manager
+                .pool
+                .try_push_bounded(test_slot(&manager, idx))
+                .unwrap();
         }
 
-        let handles: Vec<_> = (0..n)
-            .map(|_| {
-                let m = manager.clone();
-                std::thread::spawn(move || {
-                    let slot = m.allocate_any().unwrap();
-                    let idx = slot.idx;
-                    drop(slot);
-                    idx
+        // Every pooled Slot holds the same real proxy, hence its single owned
+        // DNS worker; slot count must not multiply resolver threads.
+        assert_eq!(Arc::strong_count(&manager.egress_proxy), proxy_baseline + n);
+
+        let mut allocated = HashSet::new();
+        // Keep genuine concurrent starts and all 200 allocations within the
+        // 128-task unit, leaving room for runtime and harness threads.
+        for first in (0..n).step_by(32) {
+            let count = (n - first).min(32);
+            let barrier = Arc::new(std::sync::Barrier::new(count));
+            let handles: Vec<_> = (0..count)
+                .map(|_| {
+                    let m = manager.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let slot = m.allocate_any().unwrap();
+                        let idx = slot.idx;
+                        drop(slot);
+                        idx
+                    })
                 })
-            })
-            .collect();
+                .collect();
+            for handle in handles {
+                assert!(allocated.insert(handle.join().unwrap()));
+            }
+        }
 
-        let allocated: HashSet<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
+        assert_eq!(Arc::strong_count(&manager.egress_proxy), proxy_baseline);
         // All indices must be unique
         assert_eq!(allocated.len(), n);
         // None should be slot 0
@@ -1016,11 +1035,36 @@ mod tests {
     }
 
     #[test]
+    fn allocated_slots_share_one_owned_proxy_until_shutdown() {
+        let manager = manager_with_capacity(0);
+        let baseline = Arc::strong_count(&manager.egress_proxy);
+        let reserved: Vec<_> = (1..MAX_SLOTS)
+            .filter(|idx| manager.allocated.has(*idx))
+            .collect();
+        let slots: Vec<_> = (0..200)
+            .map(|_| manager.allocate_test_slot().unwrap())
+            .collect();
+        let allocated: HashSet<_> = slots.iter().map(|slot| slot.idx).collect();
+        assert_eq!(allocated.len(), 200);
+        assert!(slots
+            .iter()
+            .all(|slot| !reserved.contains(&(slot.idx as usize))));
+        assert!(reserved.iter().all(|idx| manager.allocated.has(*idx)));
+        // allocate_slot uses the same Slot constructor/proxy ownership as the
+        // production fresh-slot path, without creating kernel network devices.
+        assert_eq!(Arc::strong_count(&manager.egress_proxy), baseline + 200);
+        drop(slots);
+        assert_eq!(Arc::strong_count(&manager.egress_proxy), baseline);
+        manager.shutdown().unwrap();
+        assert!(manager.shutting_down());
+    }
+
+    #[test]
     fn release_returns_slot_to_pool_when_under_capacity() {
         let manager = manager_with_capacity(5);
         // Pre-insert a slot into the bitset (simulating a prior allocation)
         manager.allocated.insert(10);
-        let slot = test_slot(10);
+        let slot = test_slot(&manager, 10);
         // release() should push the slot into the pool (capacity=5, pool is empty)
         manager.release(slot).unwrap();
         let pool_len = manager.pool.len();
@@ -1037,7 +1081,7 @@ mod tests {
         let manager = manager_with_capacity(5);
         // Manually put a slot (idx=42) in the pool and mark it allocated in the bitset
         manager.allocated.insert(42);
-        let pooled = test_slot(42);
+        let pooled = test_slot(&manager, 42);
         manager.pool.try_push_bounded(pooled).unwrap();
 
         // allocate_any() must pop from pool (idx=42) without calling create_network()
@@ -1054,7 +1098,7 @@ mod tests {
         // high_watermark = 0: release() must NOT push to pool, must call cleanup() instead
         let manager = manager_with_capacity(0);
         manager.allocated.insert(7);
-        let slot = test_slot(7);
+        let slot = test_slot(&manager, 7);
         manager.release(slot).unwrap();
         // Pool must be empty (slot was NOT cached)
         assert!(manager.pool.is_empty(), "pool must be empty");
@@ -1069,7 +1113,7 @@ mod tests {
     fn release_enqueues_above_high_watermark_and_drains_async() {
         let manager = NetworkManager::new(true, 0, 0);
         manager.allocated.insert(17);
-        let slot = test_slot(17);
+        let slot = test_slot(&manager, 17);
 
         manager.release(slot).unwrap();
 
@@ -1098,8 +1142,14 @@ mod tests {
         manager.allocated.insert(11);
         manager.allocated.insert(12);
 
-        manager.pool.try_push_bounded(test_slot(11)).unwrap();
-        manager.pool.try_push_bounded(test_slot(12)).unwrap();
+        manager
+            .pool
+            .try_push_bounded(test_slot(&manager, 11))
+            .unwrap();
+        manager
+            .pool
+            .try_push_bounded(test_slot(&manager, 12))
+            .unwrap();
 
         manager.shutdown().unwrap();
 
@@ -1118,7 +1168,10 @@ mod tests {
     fn shutdown_cleanup_is_idempotent() {
         let manager = manager_with_capacity(4);
         manager.allocated.insert(14);
-        manager.pool.try_push_bounded(test_slot(14)).unwrap();
+        manager
+            .pool
+            .try_push_bounded(test_slot(&manager, 14))
+            .unwrap();
 
         manager.shutdown().unwrap();
         manager.shutdown().unwrap();
@@ -1131,7 +1184,10 @@ mod tests {
     fn allocate_any_is_rejected_after_shutdown_cleanup() {
         let manager = manager_with_capacity(4);
         manager.allocated.insert(9);
-        manager.pool.try_push_bounded(test_slot(9)).unwrap();
+        manager
+            .pool
+            .try_push_bounded(test_slot(&manager, 9))
+            .unwrap();
 
         manager.shutdown().unwrap();
 
@@ -1145,7 +1201,7 @@ mod tests {
         manager.shutdown().unwrap();
 
         manager.allocated.insert(13);
-        let slot = test_slot(13);
+        let slot = test_slot(&manager, 13);
         manager.release(slot).unwrap();
 
         assert!(manager.pool.is_empty(), "pool must remain empty");
@@ -1159,7 +1215,7 @@ mod tests {
     fn release_race_with_shutdown_does_not_recache_slot() {
         let manager = Arc::new(manager_with_capacity(4));
         manager.allocated.insert(15);
-        let slot = test_slot(15);
+        let slot = test_slot(&manager, 15);
 
         let release_manager = manager.clone();
         let release_thread = std::thread::spawn(move || {
@@ -1191,7 +1247,7 @@ mod tests {
         for idx in 1u32..=50 {
             manager.allocated.insert(idx as usize);
         }
-        let slot_values: Vec<Slot> = (1u32..=50).map(test_slot).collect();
+        let slot_values: Vec<Slot> = (1u32..=50).map(|idx| test_slot(&manager, idx)).collect();
 
         // Release all 50 slots concurrently — at most 10 should end up in the pool.
         let handles: Vec<_> = slot_values
@@ -1228,7 +1284,10 @@ mod tests {
         let manager = Arc::new(manager_with_capacity(total));
         for idx in 1..=(total as u32) {
             manager.allocated.insert(idx as usize);
-            manager.pool.try_push_bounded(test_slot(idx)).unwrap();
+            manager
+                .pool
+                .try_push_bounded(test_slot(&manager, idx))
+                .unwrap();
         }
 
         // Phase 1: Allocate 50 slots concurrently from the pool
@@ -1263,7 +1322,10 @@ mod tests {
         // Re-add them to the pool so the test remains root-free.
         for idx in first_batch.iter().copied().filter(|i| i % 2 == 0) {
             manager.allocated.insert(idx as usize); // re-mark as allocated
-            manager.pool.try_push_bounded(test_slot(idx)).unwrap();
+            manager
+                .pool
+                .try_push_bounded(test_slot(&manager, idx))
+                .unwrap();
         }
         let handles: Vec<_> = (0..release_count)
             .map(|_| {

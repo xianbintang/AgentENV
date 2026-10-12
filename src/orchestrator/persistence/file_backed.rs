@@ -88,6 +88,8 @@ pub struct FileBackedSandboxPersister {
     virtualization_mode: VirtualizationMode,
     durability: LocalStoreDurability,
     db: OnceCell<LocalKvStore>,
+    #[cfg(test)]
+    qualification_delegate: Option<super::RecordingPersister>,
 }
 
 impl FileBackedSandboxPersister {
@@ -97,12 +99,22 @@ impl FileBackedSandboxPersister {
             virtualization_mode,
             durability: LocalStoreDurability::Sync,
             db: OnceCell::new(),
+            #[cfg(test)]
+            qualification_delegate: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(root: PathBuf) -> Self {
         Self::new(root, VirtualizationMode::Kvm)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_qualification_delegate() -> Self {
+        Self {
+            qualification_delegate: Some(super::RecordingPersister::default()),
+            ..Self::new_for_test(PathBuf::new())
+        }
     }
 
     pub fn with_durability(mut self, durability: LocalStoreDurability) -> Self {
@@ -252,6 +264,10 @@ impl SandboxPersister for FileBackedSandboxPersister {
     where
         F: SandboxBackendFactory,
     {
+        #[cfg(test)]
+        if let Some(delegate) = &self.qualification_delegate {
+            return delegate.load_all(factory).await;
+        }
         info!(store = %self.root.display(), "loading paused sandbox records");
         let records = self.db().await?.entries().await.map_err(|source| {
             SandboxPersistenceError::store("scan paused sandbox records", source)
@@ -320,6 +336,11 @@ impl SandboxPersister for FileBackedSandboxPersister {
         &self,
         sandbox_id: &SandboxId,
     ) -> PersistenceResult<Option<PathBuf>> {
+        #[cfg(test)]
+        if let Some(delegate) = &self.qualification_delegate {
+            return delegate.allocate_artifact_root(sandbox_id).await;
+        }
+
         let artifact_root = self
             .sandbox_artifact_root(sandbox_id)
             .join(Uuid::now_v7().to_string());
@@ -339,6 +360,13 @@ impl SandboxPersister for FileBackedSandboxPersister {
         artifact_root: Option<&Path>,
         paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()> {
+        #[cfg(test)]
+        if let Some(delegate) = &self.qualification_delegate {
+            return delegate
+                .persist_paused(metadata, artifact_root, paused_state)
+                .await;
+        }
+
         let artifact_root = artifact_root.ok_or_else(|| SandboxPersistenceError::RuntimeState {
             reason: "file-backed persister requires an allocated artifact root",
         })?;
@@ -372,6 +400,11 @@ impl SandboxPersister for FileBackedSandboxPersister {
     }
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        #[cfg(test)]
+        if let Some(delegate) = &self.qualification_delegate {
+            return delegate.mark_resuming(sandbox_id).await;
+        }
+
         debug!(sandbox_id = %sandbox_id, "marking paused sandbox as resuming");
         let mut record = self.get_record(sandbox_id).await?;
         record.lifecycle = PersistedPausedLifecycle::Resuming;
@@ -379,6 +412,11 @@ impl SandboxPersister for FileBackedSandboxPersister {
     }
 
     async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        #[cfg(test)]
+        if let Some(delegate) = &self.qualification_delegate {
+            return delegate.rollback_resuming(sandbox_id).await;
+        }
+
         debug!(sandbox_id = %sandbox_id, "rolling back paused sandbox to paused");
         let mut record = self.get_record(sandbox_id).await?;
         record.lifecycle = PersistedPausedLifecycle::Paused;
@@ -386,11 +424,21 @@ impl SandboxPersister for FileBackedSandboxPersister {
     }
 
     async fn delete_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        #[cfg(test)]
+        if let Some(delegate) = &self.qualification_delegate {
+            return delegate.delete_record(sandbox_id).await;
+        }
+
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record");
         self.remove_record(sandbox_id).await
     }
 
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        #[cfg(test)]
+        if let Some(delegate) = &self.qualification_delegate {
+            return delegate.delete_record_and_artifacts(sandbox_id).await;
+        }
+
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record and artifacts");
         self.remove_record(sandbox_id).await?;
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
@@ -411,6 +459,29 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn qualification_recording_delegate_keeps_disk_database_unopened() {
+        let persister = FileBackedSandboxPersister::with_qualification_delegate();
+        assert!(persister
+            .load_all(&MockBackendFactory::new())
+            .await
+            .unwrap()
+            .is_empty());
+        persister
+            .delete_record_and_artifacts(&SandboxId::new())
+            .await
+            .unwrap();
+        assert!(persister.db.get().is_none());
+        assert!(persister.root.as_os_str().is_empty());
+        assert_eq!(
+            persister.qualification_delegate.as_ref().unwrap().calls(),
+            vec![
+                super::super::RecordingCall::LoadAll,
+                super::super::RecordingCall::DeleteRecordAndArtifacts
+            ]
+        );
+    }
 
     #[derive(Debug)]
     struct FailingEncodeState;

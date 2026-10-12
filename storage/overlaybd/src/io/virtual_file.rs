@@ -3,6 +3,7 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 #[cfg(feature = "io-uring")]
 use std::future::Future;
 #[cfg(feature = "io-uring")]
@@ -16,10 +17,8 @@ use storage_util::{CompactBuffer, CompactWriter};
 /// Boxed non-`Send` future used by the `_with_ctx` variants on
 /// [`VirtualFile`]. The `IoCtx` borrows a `!Send` [`AsyncIoRing`] (it holds
 /// `Rc<...>` internally), so any future that captures the ring must also be
-/// non-`Send`. The existing methods on the trait (transformed by
-/// `#[async_trait]`) keep returning `Send` futures because `async_trait`
-/// only rewrites `async fn` signatures, leaving these hand-rolled methods
-/// untouched.
+/// non-`Send`. The ordinary methods on the trait return explicit `Send`
+/// boxed futures; the context-aware methods retain their local future type.
 #[cfg(feature = "io-uring")]
 pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
@@ -47,22 +46,56 @@ impl<'a> IoCtx<'a> {
 
 #[async_trait]
 pub trait VirtualFile: Send + Sync {
-    async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes>;
+    fn read_at<'life0, 'async_trait>(
+        &'life0 self,
+        offset: u64,
+        len: usize,
+    ) -> BoxFuture<'async_trait, Result<Bytes>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
-    async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {
-        if dst.is_empty() {
-            return Ok(0);
-        }
-        let data = self.read_at(offset, dst.len()).await?;
-        let n = data.len().min(dst.len());
-        dst[..n].copy_from_slice(&data[..n]);
-        Ok(n)
+    fn read_at_into<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        offset: u64,
+        dst: &'life1 mut [u8],
+    ) -> BoxFuture<'async_trait, Result<usize>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            if dst.is_empty() {
+                return Ok(0);
+            }
+            let data = self.read_at(offset, dst.len()).await?;
+            let n = data.len().min(dst.len());
+            dst[..n].copy_from_slice(&data[..n]);
+            Ok(n)
+        })
     }
 
-    async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize>;
+    fn write_at<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        offset: u64,
+        data: &'life1 [u8],
+    ) -> BoxFuture<'async_trait, Result<usize>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
-    async fn write_bytes_at(&self, offset: u64, data: Bytes) -> Result<usize> {
-        self.write_at(offset, &data).await
+    fn write_bytes_at<'life0, 'async_trait>(
+        &'life0 self,
+        offset: u64,
+        data: Bytes,
+    ) -> BoxFuture<'async_trait, Result<usize>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { self.write_at(offset, &data).await })
     }
 
     /// Optional downcast handle for concrete-type fast paths. The default
@@ -138,57 +171,138 @@ pub trait VirtualFile: Send + Sync {
         Box::pin(async move { self.write_at_with_ctx(ctx, offset, &data).await })
     }
 
-    async fn size(&self) -> Result<u64>;
+    fn size<'life0, 'async_trait>(&'life0 self) -> BoxFuture<'async_trait, Result<u64>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
-    async fn truncate(&self, _size: u64) -> Result<()> {
-        bail!("truncate is not supported")
+    fn truncate<'life0, 'async_trait>(
+        &'life0 self,
+        _size: u64,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { bail!("truncate is not supported") })
     }
 
-    async fn sync(&self) -> Result<()> {
-        bail!("sync is not supported")
+    fn sync<'life0, 'async_trait>(&'life0 self) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { bail!("sync is not supported") })
     }
 
-    async fn seek_data(&self, _offset: u64) -> Result<Option<u64>> {
-        Ok(None)
+    fn seek_data<'life0, 'async_trait>(
+        &'life0 self,
+        _offset: u64,
+    ) -> BoxFuture<'async_trait, Result<Option<u64>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { Ok(None) })
     }
 
-    async fn seek_hole(&self, _offset: u64) -> Result<Option<u64>> {
-        Ok(None)
+    fn seek_hole<'life0, 'async_trait>(
+        &'life0 self,
+        _offset: u64,
+    ) -> BoxFuture<'async_trait, Result<Option<u64>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { Ok(None) })
     }
 
     /// Discard a file range. Implementations may encode this as hole punching
     /// while preserving logical file size.
-    async fn discard(&self, _offset: u64, _len: u64) -> Result<()> {
-        bail!("discard is not supported")
+    fn discard<'life0, 'async_trait>(
+        &'life0 self,
+        _offset: u64,
+        _len: u64,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { bail!("discard is not supported") })
     }
 
     /// Hint that underlying cache/page-cache for a range can be evicted.
     /// Implementations may return Unsupported when not available.
-    async fn evict_range(&self, _offset: u64, _len: u64) -> Result<()> {
-        Ok(())
+    fn evict_range<'life0, 'async_trait>(
+        &'life0 self,
+        _offset: u64,
+        _len: u64,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { Ok(()) })
     }
 
     /// Hint that underlying cache/page-cache for the whole file can be evicted.
     /// Implementations may return Unsupported when not available.
-    async fn evict_all(&self) -> Result<()> {
-        Ok(())
+    fn evict_all<'life0, 'async_trait>(&'life0 self) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { Ok(()) })
     }
 
     /// File xattr operations, aligned with overlaybd IFileXAttr semantics.
-    async fn fgetxattr(&self, _name: &str) -> Result<Vec<u8>> {
-        bail!("fgetxattr is not supported")
+    fn fgetxattr<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _name: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<Vec<u8>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { bail!("fgetxattr is not supported") })
     }
 
-    async fn flistxattr(&self) -> Result<Vec<String>> {
-        bail!("flistxattr is not supported")
+    fn flistxattr<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> BoxFuture<'async_trait, Result<Vec<String>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { bail!("flistxattr is not supported") })
     }
 
-    async fn fsetxattr(&self, _name: &str, _value: &[u8], _flags: i32) -> Result<()> {
-        bail!("fsetxattr is not supported")
+    fn fsetxattr<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _name: &'life1 str,
+        _value: &'life2 [u8],
+        _flags: i32,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { bail!("fsetxattr is not supported") })
     }
 
-    async fn fremovexattr(&self, _name: &str) -> Result<()> {
-        bail!("fremovexattr is not supported")
+    fn fremovexattr<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _name: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { bail!("fremovexattr is not supported") })
     }
 }
 

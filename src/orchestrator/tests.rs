@@ -24,9 +24,7 @@ use crate::cfg::ResolvedImageCacheConfig;
 use crate::image::cache::test_support::{
     test_local_image_services_from_service, ImageCacheService, RecordingRuntimeImageRefs,
 };
-use crate::image::cache::{
-    local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
-};
+use crate::image::cache::{RuntimeImageOwner, RuntimeImageRefs};
 use crate::sandbox::mock::{
     MockAction, MockBackendFactory, MockBehavior, MockOperation, MockSandboxBackend, MockSnapshot,
 };
@@ -50,7 +48,7 @@ fn setup() {
 }
 
 fn test_runtime_image_refs() -> Arc<dyn RuntimeImageRefs> {
-    local_image_services_from_global_config().runtime_refs
+    crate::image::cache::test_support::owned_real_image_services().runtime_refs
 }
 
 async fn make_orchestrator() -> Arc<TestOrchestrator> {
@@ -113,7 +111,13 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         sandboxes: RwLock::new(HashMap::new()),
         template_build_ids: RwLock::new(HashSet::new()),
         deletions: tokio::sync::Mutex::new(HashMap::new()),
+        failed_launch_debts: RwLock::new(HashMap::new()),
+        failed_launch_cleanup: Mutex::new(()),
+        cleanup_provenance: std::sync::Mutex::new(CleanupHistory::default()),
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
+        native_create_incarnation: uuid::Uuid::now_v7(),
+        native_requester: None,
+        native_ingress: tokio::sync::OnceCell::new(),
         next_proxy_route_version: AtomicU64::new(1),
         counters: Default::default(),
         sandbox_metrics: Mutex::new(SandboxMetrics::default()),
@@ -173,6 +177,7 @@ struct ScriptedStoreControl {
     on_add: StoreHookSlot,
     claim_gate: StdMutex<Option<StoreClaimGate>>,
     list_gate: StdMutex<Option<StoreListGate>>,
+    capture_delete_conflict: StdMutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl ScriptedStoreControl {
@@ -267,9 +272,29 @@ impl MetadataStore for ScriptedStore {
     ) -> StdResult<SandboxState, StoreError> {
         match ScriptedStoreControl::take_action(&self.control.update_if_state_actions) {
             StoreAction::Delegate => {
-                self.inner
+                let result = self
+                    .inner
                     .update_state_if_state(sandbox_id, new_state, expected_states)
-                    .await
+                    .await;
+                if matches!(
+                    &result,
+                    Err(StoreError::StateConflict {
+                        actual_state: SandboxState::Pausing | SandboxState::Snapshotting,
+                        ..
+                    })
+                ) && expected_states == [SandboxState::Running, SandboxState::Paused]
+                {
+                    if let Some(notify) = self
+                        .control
+                        .capture_delete_conflict
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                    {
+                        notify.notify_one();
+                    }
+                }
+                result
             }
             StoreAction::Fail(err) => Err(err),
         }
@@ -726,8 +751,34 @@ impl MetadataStore for ScriptedWaitStore {
 #[tokio::test]
 async fn with_in_memory_store_constructs_without_panic() {
     setup();
-    let orchestrator = Orchestrator::with_in_memory_store().await;
-    drop(orchestrator);
+    let root = tempfile::tempdir().expect("constructor home");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "orchestrator::service::tests::owned_global_constructor_child",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("AENV_HOME_PATH", root.path())
+        .env("AGENTENV_OWNED_CACHE_CONSTRUCTOR_CHILD", "1")
+        .env_remove("AENV_CONFIG_PATH")
+        .spawn()
+        .expect("constructor child");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("constructor child deadline");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(root.path().join("image-cache/metadata/CURRENT").is_file());
+    root.close().expect("closed child cache cleanup");
 }
 
 #[tokio::test]
@@ -738,10 +789,11 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     paused.auto_resume = true;
     let persister = RecordingPersister::with_loaded(vec![paused.clone()]);
 
-    let orchestrator = Orchestrator::new(
+    let orchestrator = Orchestrator::new_inner(
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister.clone(),
+        test_runtime_image_refs(),
     )
     .await?;
 
@@ -782,10 +834,11 @@ async fn new_returns_error_when_loading_persisted_sandboxes_fails() {
     let persister = RecordingPersister::default();
     persister.fail_next(RecordingCall::LoadAll);
 
-    let result = Orchestrator::new(
+    let result = Orchestrator::new_inner(
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister.clone(),
+        test_runtime_image_refs(),
     )
     .await;
 
@@ -870,6 +923,7 @@ where
     Ok(match orchestrator.proxy_lookup_for(sandbox_id).await? {
         ProxyLookupResult::Ready(target) => Some(target),
         ProxyLookupResult::NotFound
+        | ProxyLookupResult::NativeControl
         | ProxyLookupResult::Paused { .. }
         | ProxyLookupResult::Unavailable(_)
         | ProxyLookupResult::RouteMissing => None,
@@ -1006,22 +1060,26 @@ async fn proxy_lookup_reports_paused_for_paused_sandbox() {
 
 #[tokio::test]
 async fn cleanup_failed_launch_removes_created_running_metadata() {
-    let orchestrator = make_orchestrator().await;
+    let mut orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    Arc::get_mut(&mut orchestrator).unwrap().image_refs =
+        Arc::new(RecordingRuntimeImageRefs::default());
     let sandbox_id = SandboxId::new();
     let plan = create_launch_plan_with_resources(sandbox_id);
     let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
         MockBehavior::new(),
     )))));
 
+    let mut metadata = plan
+        .transitional_metadata()
+        .expect("create metadata")
+        .clone();
+    metadata.state = SandboxState::Running;
+    orchestrator.store.add(metadata).await.unwrap();
     orchestrator
-        .store
-        .add(SandboxMetadata {
-            id: sandbox_id,
-            state: SandboxState::Running,
-            ..Default::default()
-        })
+        .sandboxes
+        .write()
         .await
-        .unwrap();
+        .insert(sandbox_id, handle.clone());
 
     orchestrator
         .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
@@ -1032,7 +1090,9 @@ async fn cleanup_failed_launch_removes_created_running_metadata() {
 
 #[tokio::test]
 async fn cleanup_failed_launch_restores_resume_metadata() {
-    let orchestrator = make_orchestrator().await;
+    let mut orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    Arc::get_mut(&mut orchestrator).unwrap().image_refs =
+        Arc::new(RecordingRuntimeImageRefs::default());
     let sandbox_id = SandboxId::new();
     let rollback_metadata = paused_resume_metadata(sandbox_id);
     let mut running_metadata = rollback_metadata.clone();
@@ -1043,6 +1103,11 @@ async fn cleanup_failed_launch_restores_resume_metadata() {
     )))));
 
     orchestrator.store.add(running_metadata).await.unwrap();
+    orchestrator
+        .sandboxes
+        .write()
+        .await
+        .insert(sandbox_id, handle.clone());
 
     orchestrator
         .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
@@ -1313,10 +1378,12 @@ async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()
         .await
         .into_iter()
         .map(|(id, artifacts)| {
-            (
-                id.to_string(),
-                artifacts.into_overlaybd_image_config_paths(),
-            )
+            let (paths, native) = artifacts.split();
+            assert!(
+                native.is_empty(),
+                "OverlayBD fixture cannot discard native protection"
+            );
+            (id.to_string(), paths)
         })
         .collect();
     let summary = image_cache
@@ -2012,7 +2079,7 @@ async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_r
 }
 
 #[tokio::test]
-async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics() -> Result<()> {
+async fn capture_snapshot_terminal_failed_stop_retains_owner_until_explicit_retry() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -2028,11 +2095,18 @@ async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics(
         },
     );
     let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[("team", "snapshot-terminal")]))
         .await?;
     let sandbox_id = created.id;
+    let original = orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&sandbox_id)
+        .cloned()
+        .unwrap();
 
     let err = orchestrator
         .capture_snapshot(sandbox_id)
@@ -2046,10 +2120,57 @@ async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics(
         }
     ));
 
-    assert!(
-        orchestrator.get_sandbox(&sandbox_id).await?.is_none(),
-        "terminal snapshot failure should remove sandbox metadata"
+    let retained = orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&sandbox_id)
+        .cloned()
+        .expect("failed physical Stop retains original snapshot backend");
+    assert!(Arc::ptr_eq(&original, &retained));
+    assert_eq!(
+        orchestrator.get_sandbox(&sandbox_id).await?.unwrap().state,
+        SandboxState::Killing
     );
+    assert_eq!(
+        orchestrator.proxy_lookup_for(&sandbox_id).await?,
+        ProxyLookupResult::Unavailable(SandboxState::Killing)
+    );
+    let progress = orchestrator
+        .deletions
+        .lock()
+        .await
+        .get(&sandbox_id)
+        .cloned()
+        .unwrap();
+    assert!(matches!(
+        *progress.lock().await,
+        DeleteProgress::Stop {
+            capture_failed: true
+        }
+    ));
+    assert_eq!(behavior.stop_calls(), 1);
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        0,
+        1,
+        0,
+        created.resources.cpu_count,
+        created.resources.memory_mib,
+    )
+    .await;
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert_eq!(behavior.stop_calls(), 2);
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    assert!(orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&sandbox_id)
+        .is_none());
+    assert!(matches!(*progress.lock().await, DeleteProgress::Done));
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
@@ -2653,10 +2774,7 @@ async fn orchestrator_delete_during_pause_completes_cleanly() -> Result<()> {
     let pause_outcome = pause_result.expect("pause task should not panic");
     assert!(
         pause_outcome.is_ok()
-            || matches!(
-                pause_outcome,
-                Err(OrchestratorError::SandboxNotFound(_))
-            ),
+            || matches!(pause_outcome, Err(OrchestratorError::SandboxNotFound(_))),
         "pause during delete should either succeed or report SandboxNotFound, got: {pause_outcome:?}"
     );
 
@@ -2842,7 +2960,7 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
     use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
 
     let temp = TempDir::new()?;
-    let backend = PosixFsBackend::new(PosixFsBackendConfig {
+    let backend = PosixFsBackend::new_owned_fixture(PosixFsBackendConfig {
         root: temp.path().join("repository"),
         cache_root: Some(temp.path().join("cache")),
         runtime_cache_root: Some(temp.path().join("runtime")),
@@ -3112,7 +3230,7 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
     use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
 
     let temp = TempDir::new()?;
-    let backend = PosixFsBackend::new(PosixFsBackendConfig {
+    let backend = PosixFsBackend::new_owned_fixture(PosixFsBackendConfig {
         root: temp.path().join("repository"),
         cache_root: Some(temp.path().join("cache")),
         runtime_cache_root: Some(temp.path().join("runtime")),
@@ -5918,5 +6036,1063 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     );
     release.notify_one();
     assert!(task.await.unwrap()?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_ready_and_failed_stop_keep_original_owner_and_transitional_metadata() -> Result<()>
+{
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::WaitForReady,
+        MockAction::Fail {
+            message: "original readiness failure".into(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "cleanup still unresolved".into(),
+        },
+    );
+    let mut orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    Arc::get_mut(&mut orchestrator)
+        .expect("exclusive fixture")
+        .image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    let err = orchestrator
+        .create_sandbox(create_request(
+            Some(30),
+            &[("team", "failed-launch-custody")],
+        ))
+        .await
+        .expect_err("readiness must fail");
+    let sandbox_id = match err {
+        OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: SandboxOperation::WaitReady,
+            ..
+        } => sandbox_id,
+        other => panic!("unexpected result: {other:?}"),
+    };
+    assert_eq!(behavior.stop_calls(), 1);
+    let retained = orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&sandbox_id)
+        .cloned();
+    assert!(
+        retained.is_some(),
+        "failed cleanup must retain the original backend owner"
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("transitional metadata retained")
+            .state,
+        SandboxState::Creating
+    );
+    assert!(orchestrator
+        .proxy_routes
+        .read()
+        .await
+        .route(&sandbox_id)
+        .is_none());
+    assert_eq!(orchestrator.failed_launch_debts.read().await.len(), 1);
+    let (first, second) = tokio::join!(
+        orchestrator.retry_failed_launch_debts(Some(sandbox_id)),
+        orchestrator.retry_failed_launch_debts(Some(sandbox_id))
+    );
+    first?;
+    second?;
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert_eq!(behavior.stop_calls(), 2);
+    assert!(orchestrator.failed_launch_debts.read().await.is_empty());
+    assert!(orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&sandbox_id)
+        .is_none());
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_start_and_failed_stop_keep_original_owner_before_registration() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    for operation in [MockOperation::StartNowait, MockOperation::Stop] {
+        behavior.push_action(
+            operation,
+            MockAction::Fail {
+                message: "original launch unresolved".into(),
+            },
+        );
+    }
+    let mut orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    Arc::get_mut(&mut orchestrator)
+        .expect("exclusive fixture")
+        .image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    let err = orchestrator
+        .create_sandbox(create_request(
+            Some(30),
+            &[("team", "failed-start-custody")],
+        ))
+        .await
+        .expect_err("start must fail");
+    let sandbox_id = match err {
+        OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: SandboxOperation::Start,
+            ..
+        } => sandbox_id,
+        other => panic!("unexpected result: {other:?}"),
+    };
+    let retained = orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&sandbox_id)
+        .cloned()
+        .expect("original owner retained");
+    assert_eq!(behavior.stop_calls(), 1);
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("Creating retained")
+            .state,
+        SandboxState::Creating
+    );
+    assert!(orchestrator
+        .proxy_routes
+        .read()
+        .await
+        .route(&sandbox_id)
+        .is_none());
+    assert!(Arc::ptr_eq(
+        &retained,
+        &orchestrator
+            .failed_launch_debts
+            .read()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .handle
+    ));
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert_eq!(behavior.stop_calls(), 2);
+    assert!(orchestrator.failed_launch_debts.read().await.is_empty());
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_launch_debt_supplies_metadata_when_persistence_fails() -> Result<()> {
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    control.push_add_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("retained metadata unavailable"),
+    }));
+    let behavior = Arc::new(MockBehavior::new());
+    for operation in [MockOperation::StartNowait, MockOperation::Stop] {
+        behavior.push_action(
+            operation,
+            MockAction::Fail {
+                message: "uncertain original owner".into(),
+            },
+        );
+    }
+    let mut owner = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(control),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    Arc::get_mut(&mut owner).unwrap().image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    let error = owner
+        .create_sandbox(create_request(Some(30), &[]))
+        .await
+        .expect_err("launch refuses");
+    let id = match error {
+        OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: SandboxOperation::Start,
+            ..
+        } => sandbox_id,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(owner.store.get(&id).await?.is_none());
+    assert_eq!(
+        owner.get_sandbox(&id).await?.unwrap().state,
+        SandboxState::Creating
+    );
+    assert_eq!(owner.failed_launch_debts.read().await.len(), 1);
+    let retained = owner.get_sandbox(&id).await?.unwrap();
+    assert_eq!(owner.list_sandbox_ids().await?, vec![id]);
+    assert_eq!(owner.list_sandboxes().await?.len(), 1);
+    assert_eq!(
+        owner
+            .list_sandboxes_filtered(SandboxListFilter {
+                states: Some(vec![SandboxState::Creating]),
+                started_after: Some(retained.created_at),
+                ..Default::default()
+            })
+            .await?
+            .len(),
+        1
+    );
+    for filter in [
+        SandboxListFilter {
+            states: Some(vec![SandboxState::Running]),
+            ..Default::default()
+        },
+        SandboxListFilter {
+            excluded_states: Some(vec![SandboxState::Creating]),
+            ..Default::default()
+        },
+        SandboxListFilter {
+            started_after: Some(retained.created_at + Duration::from_secs(1)),
+            ..Default::default()
+        },
+        SandboxListFilter {
+            template: Some("foreign-template".into()),
+            ..Default::default()
+        },
+        SandboxListFilter {
+            user_metadata: Some(HashMap::from([("foreign".into(), "value".into())])),
+            ..Default::default()
+        },
+    ] {
+        assert!(owner.list_sandboxes_filtered(filter).await?.is_empty());
+    }
+
+    owner.delete_sandbox(id).await?;
+    assert_eq!(behavior.stop_calls(), 2);
+    assert!(owner.get_sandbox(&id).await?.is_none());
+    assert!(owner.failed_launch_debts.read().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn displaced_failed_launch_debt_keeps_original_and_never_detaches_replacement() -> Result<()>
+{
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::WaitForReady,
+        MockAction::Fail {
+            message: "ready lost".into(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "cleanup unresolved".into(),
+        },
+    );
+    behavior.set_runtime_info(SandboxRuntimeInfo {
+        runtime_artifacts: RuntimeArtifactSet::from_overlaybd_image_configs(vec![PathBuf::from(
+            "owned/debt-image.json",
+        )]),
+        ..Default::default()
+    });
+    let mut owner = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let refs = Arc::new(RecordingRuntimeImageRefs::default());
+    Arc::get_mut(&mut owner).unwrap().image_refs = refs.clone();
+    let error = owner
+        .create_sandbox(create_request(Some(30), &[]))
+        .await
+        .expect_err("ready refuses");
+    let id = match error {
+        OrchestratorError::SandboxOperationFailed { sandbox_id, .. } => sandbox_id,
+        other => panic!("unexpected: {other:?}"),
+    };
+    let original = owner.sandboxes.read().await.get(&id).unwrap().clone();
+    let created = owner.create_sandbox(create_request(Some(30), &[])).await?;
+    let replacement = owner
+        .sandboxes
+        .read()
+        .await
+        .get(&created.id)
+        .unwrap()
+        .clone();
+    owner
+        .sandboxes
+        .write()
+        .await
+        .insert(id, replacement.clone());
+    assert!(Arc::ptr_eq(
+        &original,
+        &owner
+            .failed_launch_debts
+            .read()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .handle
+    ));
+    let inventory = owner.collect_running_artifacts().await;
+    assert_eq!(
+        inventory.len(),
+        3,
+        "replacement registry plus independent debt inventory"
+    );
+    owner.retry_failed_launch_debts(Some(id)).await?;
+    assert!(owner.failed_launch_debts.read().await.is_empty());
+    assert!(Arc::ptr_eq(
+        &replacement,
+        owner.sandboxes.read().await.get(&id).unwrap()
+    ));
+    assert_eq!(
+        owner.store.get(&id).await?.unwrap().state,
+        SandboxState::Creating
+    );
+    assert!(
+        !refs
+            .unpinned()
+            .contains(&RuntimeImageOwner::StartingSandbox(id)),
+        "never release replacement/shared owner under stale cleanup"
+    );
+    assert!(refs.unpinned().iter().any(|value| matches!(value, RuntimeImageOwner::StartingSandbox(debt_id) if *debt_id != id && *debt_id != created.id)));
+    assert!(!owner.cleanup_provenance.lock().unwrap().retired(id));
+    owner.store.remove(&id).await?;
+    let before_refs = refs.unpinned();
+    let replacement_before = owner.sandboxes.read().await.get(&id).unwrap().clone();
+    assert!(matches!(
+        owner.delete_sandbox(id).await,
+        Err(OrchestratorError::SandboxNotFound(missing)) if missing == id
+    ));
+    assert!(Arc::ptr_eq(
+        &replacement_before,
+        owner.sandboxes.read().await.get(&id).unwrap()
+    ));
+    assert_eq!(refs.unpinned(), before_refs);
+    assert!(!owner.cleanup_provenance.lock().unwrap().retired(id));
+    owner.sandboxes.write().await.remove(&id);
+    owner.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FailedDebtPinRefs {
+    records: Arc<RecordingRuntimeImageRefs>,
+    calls: AtomicU64,
+}
+#[async_trait]
+impl RuntimeImageRefs for FailedDebtPinRefs {
+    async fn pin(
+        &self,
+        owner: RuntimeImageOwner,
+        artifacts: RuntimeArtifactSet,
+    ) -> anyhow::Result<()> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if matches!(call, 2 | 3) {
+            return Err(anyhow::anyhow!("independent debt pin unavailable"));
+        }
+        self.records.pin(owner, artifacts).await
+    }
+    async fn unpin_best_effort(&self, owner: RuntimeImageOwner) {
+        self.records.unpin_best_effort(owner).await;
+    }
+    async fn reconcile_paused(&self, ids: &[SandboxId]) -> anyhow::Result<()> {
+        self.records.reconcile_paused(ids).await
+    }
+    async fn maintain_running(
+        &self,
+        running: Vec<(SandboxId, RuntimeArtifactSet)>,
+    ) -> anyhow::Result<()> {
+        self.records.maintain_running(running).await
+    }
+}
+#[tokio::test]
+async fn failed_debt_pin_never_claims_protection_or_drops_owner() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::WaitForReady,
+        MockAction::Fail {
+            message: "ready failed".into(),
+        },
+    );
+    let mut owner = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let records = Arc::new(RecordingRuntimeImageRefs::default());
+    Arc::get_mut(&mut owner).unwrap().image_refs = Arc::new(FailedDebtPinRefs {
+        records: records.clone(),
+        calls: AtomicU64::new(0),
+    });
+    let error = owner
+        .create_sandbox(create_request(Some(30), &[]))
+        .await
+        .expect_err("ready refuses");
+    let id = match error {
+        OrchestratorError::SandboxOperationFailed { sandbox_id, .. } => sandbox_id,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "no cleanup until independent artifact protection exists"
+    );
+    assert!(
+        !owner
+            .failed_launch_debts
+            .read()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .pin_ready
+    );
+    assert!(owner.sandboxes.read().await.contains_key(&id));
+    assert!(records.unpinned().is_empty());
+    owner.delete_sandbox(id).await?;
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(owner.failed_launch_debts.read().await.is_empty());
+    assert!(owner.get_sandbox(&id).await?.is_none());
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PublicationBarrierRefs {
+    records: RecordingRuntimeImageRefs,
+    calls: AtomicU64,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait]
+impl RuntimeImageRefs for PublicationBarrierRefs {
+    async fn pin(
+        &self,
+        owner: RuntimeImageOwner,
+        artifacts: RuntimeArtifactSet,
+    ) -> anyhow::Result<()> {
+        self.records.pin(owner, artifacts).await?;
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+    async fn unpin_best_effort(&self, owner: RuntimeImageOwner) {
+        self.records.unpin_best_effort(owner).await;
+    }
+    async fn reconcile_paused(&self, ids: &[SandboxId]) -> anyhow::Result<()> {
+        self.records.reconcile_paused(ids).await
+    }
+    async fn maintain_running(
+        &self,
+        running: Vec<(SandboxId, RuntimeArtifactSet)>,
+    ) -> anyhow::Result<()> {
+        self.records.maintain_running(running).await
+    }
+}
+#[tokio::test]
+async fn debt_publication_and_retry_cannot_reinsert_a_reaped_owner() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::StartNowait,
+        MockAction::Fail {
+            message: "startup effect uncertain".into(),
+        },
+    );
+    let refs = Arc::new(PublicationBarrierRefs {
+        records: RecordingRuntimeImageRefs::default(),
+        calls: AtomicU64::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut owner = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    Arc::get_mut(&mut owner).unwrap().image_refs = refs.clone();
+    let launch_owner = owner.clone();
+    let launch = tokio::spawn(async move {
+        launch_owner
+            .create_sandbox(create_request(Some(30), &[]))
+            .await
+    });
+    refs.entered.notified().await;
+    let id = owner
+        .failed_launch_debts
+        .read()
+        .await
+        .values()
+        .next()
+        .unwrap()
+        .sandbox_id;
+    assert!(!owner.sandboxes.read().await.contains_key(&id));
+    let retry_owner = owner.clone();
+    let retry = tokio::spawn(async move { retry_owner.retry_failed_launch_debts(Some(id)).await });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(!retry.is_finished());
+    assert_eq!(behavior.stop_calls(), 0);
+    refs.release.notify_one();
+    assert!(launch.await.expect("launch task must finish").is_err());
+    retry.await.expect("retry task must finish")?;
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(owner.failed_launch_debts.read().await.is_empty());
+    assert!(!owner.sandboxes.read().await.contains_key(&id));
+    assert!(owner.get_sandbox(&id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unregistered_cleanup_cannot_remove_foreign_metadata_without_a_current_owner() {
+    let mut orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let refs = Arc::new(RecordingRuntimeImageRefs::default());
+    Arc::get_mut(&mut orchestrator).unwrap().image_refs = refs.clone();
+    let id = SandboxId::new();
+    let plan = create_launch_plan_with_resources(id);
+    let mut foreign = plan.transitional_metadata().unwrap().clone();
+    foreign.created_at += Duration::from_secs(1);
+    foreign.state = SandboxState::Running;
+    orchestrator.store.add(foreign.clone()).await.unwrap();
+    let behavior = Arc::new(MockBehavior::new());
+    let unregistered: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
+        behavior.clone(),
+    ))));
+    orchestrator
+        .cleanup_failed_launch(&plan, unregistered, FailedLaunchStage::RunningPersisted)
+        .await;
+    let retained = orchestrator
+        .store
+        .get(&id)
+        .await
+        .unwrap()
+        .expect("foreign metadata remains");
+    assert_eq!(retained.created_at, foreign.created_at);
+    assert_eq!(retained.state, SandboxState::Running);
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(orchestrator.sandboxes.read().await.is_empty());
+    assert!(orchestrator.failed_launch_debts.read().await.is_empty());
+    assert!(!refs
+        .unpinned()
+        .contains(&RuntimeImageOwner::StartingSandbox(id)));
+}
+
+#[tokio::test]
+async fn native_control_launch_does_not_require_a_fabricated_http_ip() -> Result<()> {
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_native_control_ready(true);
+    let mut owner = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior_and_host_ip(behavior.clone(), None),
+    );
+    Arc::get_mut(&mut owner).unwrap().image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    let id = SandboxId::new();
+    let metadata = owner
+        .launch_sandbox(create_launch_plan_with_resources(id))
+        .await?;
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert_eq!(behavior.stop_calls(), 0);
+    assert!(owner
+        .proxy_routes
+        .read()
+        .await
+        .route(&id)
+        .unwrap()
+        .target()
+        .is_none());
+    assert_eq!(
+        owner.proxy_lookup_for(&id).await?,
+        ProxyLookupResult::NativeControl
+    );
+    owner.delete_sandbox(id).await?;
+    assert_eq!(behavior.stop_calls(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_control_route_survives_failed_pause_and_failed_stop() -> Result<()> {
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_native_control_ready(true);
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::Fail {
+            message: "native snapshot unsupported".into(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "original VMM retained".into(),
+        },
+    );
+    let mut owner = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior_and_host_ip(behavior.clone(), None),
+    );
+    Arc::get_mut(&mut owner).unwrap().image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    let id = SandboxId::new();
+    owner
+        .launch_sandbox(create_launch_plan_with_resources(id))
+        .await?;
+    assert!(owner.pause_sandbox(id).await.is_err());
+    assert_eq!(
+        owner.proxy_lookup_for(&id).await?,
+        ProxyLookupResult::NativeControl
+    );
+    assert!(owner.delete_sandbox(id).await.is_err());
+    assert_eq!(
+        owner.proxy_lookup_for(&id).await?,
+        ProxyLookupResult::NativeControl
+    );
+    assert!(owner.sandboxes.read().await.contains_key(&id));
+    assert_eq!(
+        owner.store.get(&id).await?.unwrap().state,
+        SandboxState::Killing
+    );
+    let progress = owner.deletions.lock().await.get(&id).cloned().unwrap();
+    assert!(matches!(
+        *progress.lock().await,
+        DeleteProgress::Stop { .. }
+    ));
+    assert_eq!(behavior.stop_calls(), 1);
+    owner.delete_sandbox(id).await?;
+    assert_eq!(
+        owner.proxy_lookup_for(&id).await?,
+        ProxyLookupResult::NotFound
+    );
+    assert_eq!(behavior.stop_calls(), 2);
+    Ok(())
+}
+
+async fn actual_failed_ready_original(
+    owner: &Arc<TestOrchestrator>,
+    behavior: &Arc<MockBehavior>,
+    refuse_stop: bool,
+) -> Result<SandboxId> {
+    behavior.push_action(
+        MockOperation::WaitForReady,
+        MockAction::Fail {
+            message: "cleanup provenance original readiness refusal".into(),
+        },
+    );
+    if refuse_stop {
+        behavior.push_action(
+            MockOperation::Stop,
+            MockAction::Fail {
+                message: "cleanup provenance original stop refusal".into(),
+            },
+        );
+    }
+    match owner.create_sandbox(create_request(Some(30), &[])).await {
+        Err(OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: SandboxOperation::WaitReady,
+            ..
+        }) => Ok(sandbox_id),
+        Err(other) => Err(other),
+        Ok(_) => Err(OrchestratorError::InternalError(
+            "original readiness refusal missing".into(),
+        )),
+    }
+}
+
+#[tokio::test]
+async fn failed_cleanup_reserved_original_cannot_ack_until_actual_retirement() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let mut owner = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    Arc::get_mut(&mut owner).unwrap().image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    let id = actual_failed_ready_original(&owner, &behavior, true).await?;
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(!owner.cleanup_provenance.lock().unwrap().retired(id));
+    let retained = owner
+        .failed_launch_debts
+        .read()
+        .await
+        .values()
+        .find(|debt| debt.sandbox_id == id)
+        .expect("actual original debt retained")
+        .handle
+        .clone();
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "original still unresolved".into(),
+        },
+    );
+    assert!(owner.delete_sandbox(id).await.is_err());
+    assert_eq!(behavior.stop_calls(), 2);
+    assert!(!owner.cleanup_provenance.lock().unwrap().retired(id));
+    assert!(owner
+        .failed_launch_debts
+        .read()
+        .await
+        .values()
+        .any(|debt| debt.sandbox_id == id && Arc::ptr_eq(&debt.handle, &retained)));
+    let (first, second) = tokio::join!(
+        owner.retry_failed_launch_debts(Some(id)),
+        owner.retry_failed_launch_debts(Some(id))
+    );
+    first?;
+    second?;
+    assert_eq!(behavior.stop_calls(), 3);
+    assert!(owner.cleanup_provenance.lock().unwrap().retired(id));
+    owner.delete_sandbox(id).await?;
+    assert_eq!(
+        behavior.stop_calls(),
+        3,
+        "original completed acknowledgement cannot stop again"
+    );
+    let foreign = SandboxId::new();
+    assert!(matches!(owner.delete_sandbox(foreign).await,
+        Err(OrchestratorError::SandboxNotFound(actual)) if actual==foreign));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_provenance_capacity_retains_original_before_any_stop_and_never_refunds(
+) -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let mut owner = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    Arc::get_mut(&mut owner).unwrap().image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    let mut originals = Vec::new();
+    for _ in 0..CLEANUP_PROVENANCE_CAP {
+        let id = actual_failed_ready_original(&owner, &behavior, false).await?;
+        assert!(owner.cleanup_provenance.lock().unwrap().retired(id));
+        originals.push(id);
+    }
+    assert_eq!(behavior.stop_calls(), CLEANUP_PROVENANCE_CAP);
+    assert_eq!(
+        owner
+            .cleanup_provenance
+            .lock()
+            .unwrap()
+            .slots
+            .iter()
+            .flatten()
+            .count(),
+        CLEANUP_PROVENANCE_CAP
+    );
+    for id in originals {
+        owner.delete_sandbox(id).await?;
+    }
+    assert_eq!(behavior.stop_calls(), CLEANUP_PROVENANCE_CAP);
+    let excess = actual_failed_ready_original(&owner, &behavior, false).await?;
+    assert_eq!(
+        behavior.stop_calls(),
+        CLEANUP_PROVENANCE_CAP,
+        "capacity refuses before original stop"
+    );
+    assert!(owner
+        .get_sandbox(&excess)
+        .await?
+        .is_some_and(|m| m.state == SandboxState::Creating));
+    let retained = owner
+        .failed_launch_debts
+        .read()
+        .await
+        .values()
+        .find(|debt| debt.sandbox_id == excess)
+        .expect("capacity must keep actual original owner")
+        .handle
+        .clone();
+    assert!(matches!(
+        owner.retry_failed_launch_debts(Some(excess)).await,
+        Err(OrchestratorError::FailedLaunchCleanupCapacity)
+    ));
+    assert!(matches!(
+        owner.delete_sandbox(excess).await,
+        Err(OrchestratorError::FailedLaunchCleanupCapacity)
+    ));
+    assert_eq!(behavior.stop_calls(), CLEANUP_PROVENANCE_CAP);
+    assert!(owner
+        .failed_launch_debts
+        .read()
+        .await
+        .values()
+        .any(|debt| debt.sandbox_id == excess && Arc::ptr_eq(&debt.handle, &retained)));
+    assert_eq!(
+        owner
+            .cleanup_provenance
+            .lock()
+            .unwrap()
+            .slots
+            .iter()
+            .flatten()
+            .count(),
+        CLEANUP_PROVENANCE_CAP,
+        "history never refunds or evicts original slots"
+    );
+    // This logical mock fixture deliberately retains unresolved owner debt until
+    // its local holders drop; it asserts no physical child/VM absence or GC.
+    Ok(())
+}
+
+#[test]
+fn cleanup_provenance_layout_is_fixed_inline_and_not_an_allocator_claim() {
+    let slot = std::mem::size_of::<Option<CleanupProvenance>>();
+    let history = std::mem::size_of::<CleanupHistory>();
+    eprintln!(
+        "cleanup_provenance_layout slots={CLEANUP_PROVENANCE_CAP} slot_bytes={slot} history_bytes={history}"
+    );
+    assert_eq!(history, CLEANUP_PROVENANCE_CAP * slot);
+    assert!(
+        history <= 2048,
+        "fixed original history must remain bounded inline"
+    );
+}
+
+#[tokio::test]
+#[ignore = "owned subprocess entry for public global constructor coverage"]
+async fn owned_global_constructor_child() {
+    assert_eq!(
+        std::env::var("AGENTENV_OWNED_CACHE_CONSTRUCTOR_CHILD").as_deref(),
+        Ok("1")
+    );
+    let home = PathBuf::from(std::env::var_os("AENV_HOME_PATH").expect("owned home"));
+    let config = crate::cfg::ConfigManager::global_config();
+    assert_eq!(config.home_path, home, "refuse any non-owned global cache");
+    let resolver = crate::image::ImageResolver::new(config);
+    let backend = crate::snapshot::repository::backends::PosixFsBackend::new(
+        crate::snapshot::repository::backends::PosixFsBackendConfig {
+            root: home.join("constructor-repository"),
+            cache_root: Some(home.join("constructor-artifacts")),
+            runtime_cache_root: Some(home.join("constructor-runtime")),
+        },
+    )
+    .expect("public backend constructor");
+    let orchestrator = Orchestrator::with_in_memory_store().await;
+    orchestrator.shutdown().await.expect("constructor shutdown");
+    drop(backend);
+    drop(resolver);
+    drop(orchestrator);
+}
+
+#[tokio::test]
+async fn expired_original_stop_keeps_serialized_delete_owner_without_dispatch() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let owner =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
+    let created = owner.create_sandbox(create_request(Some(60), &[])).await?;
+    let id = created.id;
+    let held = owner.sandboxes.read().await.get(&id).unwrap().clone();
+    let original_until = std::time::Instant::now();
+    for _ in 0..2 {
+        assert!(owner
+            .delete_sandbox_inner_with_stop_until(id, Some(original_until))
+            .await
+            .is_err());
+        assert_eq!(behavior.stop_calls(), 0);
+        assert!(Arc::ptr_eq(
+            owner.sandboxes.read().await.get(&id).unwrap(),
+            &held
+        ));
+        assert_eq!(
+            owner.store.get(&id).await?.unwrap().state,
+            SandboxState::Running
+        );
+        let progress = owner.deletion_progress(id).await;
+        assert!(matches!(*progress.lock().await, DeleteProgress::Capture));
+    }
+    owner.delete_sandbox(id).await?;
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(owner.get_sandbox(&id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_pause_failed_stop_retains_same_backend_and_stop_phase() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::FailTerminal {
+            message: "terminal capture refusal".into(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "original backend still live".into(),
+        },
+    );
+    let mut owner = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    Arc::get_mut(&mut owner).unwrap().image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    let id = SandboxId::new();
+    owner
+        .launch_sandbox(create_launch_plan_with_resources(id))
+        .await?;
+    let original = owner.sandboxes.read().await.get(&id).cloned().unwrap();
+    assert!(owner.pause_sandbox(id).await.is_err());
+    let retained = owner
+        .sandboxes
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .expect("failed physical Stop retains original backend");
+    assert!(Arc::ptr_eq(&original, &retained));
+    assert_eq!(
+        owner.store.get(&id).await?.unwrap().state,
+        SandboxState::Killing
+    );
+    assert_eq!(
+        owner.proxy_lookup_for(&id).await?,
+        ProxyLookupResult::Unavailable(SandboxState::Killing)
+    );
+    let progress = owner.deletions.lock().await.get(&id).cloned().unwrap();
+    assert!(matches!(
+        *progress.lock().await,
+        DeleteProgress::Stop {
+            capture_failed: true
+        }
+    ));
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(owner.pause_sandbox(id).await.is_err());
+    assert_eq!(behavior.stop_calls(), 1);
+    owner.delete_sandbox(id).await?;
+    assert_eq!(behavior.stop_calls(), 2);
+    assert!(owner.store.get(&id).await?.is_none());
+    assert!(!owner.sandboxes.read().await.contains_key(&id));
+    assert!(matches!(*progress.lock().await, DeleteProgress::Done));
+    Ok(())
+}
+
+// Gate the exact Delete/terminal-capture interleaving; no sleeps select it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_capture_concurrent_delete_does_not_hold_handoff_mutex() -> Result<()> {
+    for operation in [MockOperation::Pause, MockOperation::Snapshot] {
+        let behavior = Arc::new(MockBehavior::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        behavior.set_on_operation(
+            operation,
+            Arc::new({
+                let entered = entered.clone();
+                let release = release.clone();
+                move || {
+                    entered.notify_one();
+                    let (released, condition) = &*release;
+                    let (released, _) = condition
+                        .wait_timeout_while(
+                            released.lock().expect("capture release state"),
+                            Duration::from_secs(2),
+                            |released| !*released,
+                        )
+                        .expect("bounded capture release wait");
+                    assert!(
+                        *released,
+                        "capture hook release exceeded original two seconds"
+                    );
+                }
+            }),
+        );
+        behavior.push_action(
+            operation,
+            MockAction::FailTerminal {
+                message: "terminal gated capture".into(),
+            },
+        );
+        // Each concurrent caller performs one genuine failed Stop; neither can
+        // claim retirement. Only the later explicit third Stop may complete.
+        for _ in 0..2 {
+            behavior.push_action(
+                MockOperation::Stop,
+                MockAction::Fail {
+                    message: "original live backend".into(),
+                },
+            );
+        }
+        let control = Arc::new(ScriptedStoreControl::default());
+        let conflict = Arc::new(tokio::sync::Notify::new());
+        *control.capture_delete_conflict.lock().unwrap() = Some(conflict.clone());
+        let mut owner = make_orchestrator_without_background_with_factory(
+            ScriptedStore::new(control),
+            MockBackendFactory::with_behavior(behavior.clone()),
+        );
+        Arc::get_mut(&mut owner).unwrap().image_refs =
+            Arc::new(RecordingRuntimeImageRefs::default());
+        let id = SandboxId::new();
+        owner
+            .launch_sandbox(create_launch_plan_with_resources(id))
+            .await?;
+        let original = owner.sandboxes.read().await.get(&id).cloned().unwrap();
+        let capture = tokio::spawn({
+            let owner = owner.clone();
+            async move {
+                if operation == MockOperation::Pause {
+                    owner.pause_sandbox(id).await
+                } else {
+                    owner.capture_snapshot(id).await.map(|_| ())
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("capture entered original hook");
+        let delete = tokio::spawn({
+            let owner = owner.clone();
+            async move { owner.delete_sandbox(id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), conflict.notified())
+            .await
+            .expect("delete observed capture state conflict");
+        {
+            let (released, condition) = &*release;
+            *released.lock().expect("capture release state") = true;
+            condition.notify_all();
+        }
+        let (capture, delete) = tokio::time::timeout(Duration::from_secs(2), async {
+            (capture.await, delete.await)
+        })
+        .await
+        .expect("capture and delete completed without handoff mutex cycle");
+        assert!(capture.expect("capture task joined").is_err());
+        assert!(delete.expect("delete task joined").is_err());
+        let retained = owner.sandboxes.read().await.get(&id).cloned().unwrap();
+        assert!(Arc::ptr_eq(&retained, &original));
+        assert_eq!(
+            owner.store.get(&id).await?.unwrap().state,
+            SandboxState::Killing
+        );
+        assert_eq!(
+            owner.proxy_lookup_for(&id).await?,
+            ProxyLookupResult::Unavailable(SandboxState::Killing)
+        );
+        let progress = owner.deletions.lock().await.get(&id).cloned().unwrap();
+        assert!(matches!(
+            *progress.lock().await,
+            DeleteProgress::Stop {
+                capture_failed: true
+            }
+        ));
+        assert_eq!(behavior.stop_calls(), 2);
+        owner.delete_sandbox(id).await?;
+        assert_eq!(behavior.stop_calls(), 3);
+        assert!(owner.store.get(&id).await?.is_none());
+    }
     Ok(())
 }

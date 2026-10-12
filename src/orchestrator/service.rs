@@ -44,7 +44,7 @@ use crate::sandbox::logs::log_query_window;
 use sandbox_metrics::SandboxMetrics;
 
 type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
-#[derive(Default)]
+#[derive(Clone, Default)]
 enum DeleteProgress {
     #[default]
     Capture,
@@ -53,8 +53,87 @@ enum DeleteProgress {
     },
     Release {
         capture_failed: bool,
+        retiring_native: Option<RuntimeArtifactSet>,
     },
     Done,
+}
+
+#[derive(Clone)]
+struct FailedLaunchDebt {
+    sandbox_id: SandboxId,
+    handle: SandboxHandle,
+    metadata: Option<SandboxMetadata>,
+    create: bool,
+    expected_state: Option<SandboxState>,
+    pin_ready: bool,
+    artifacts: RuntimeArtifactSet,
+}
+
+// Instance-bound provenance of genuine failed-launch cleanup, not a create
+// allocator or durable registry. Slots are never evicted, refunded or inferred
+// from a caller-supplied ID. Exhaustion retains the original heavy owner debt.
+const CLEANUP_PROVENANCE_CAP: usize = 32;
+#[derive(Clone, Copy)]
+struct CleanupProvenance {
+    sandbox_id: SandboxId,
+    retired: bool,
+}
+#[derive(Clone, Copy)]
+struct CleanupHistory {
+    slots: [Option<CleanupProvenance>; CLEANUP_PROVENANCE_CAP],
+}
+impl Default for CleanupHistory {
+    fn default() -> Self {
+        Self {
+            slots: [None; CLEANUP_PROVENANCE_CAP],
+        }
+    }
+}
+impl CleanupHistory {
+    // Transactional fixed-capacity reservation before any batch cleanup effect.
+    fn reserve(&mut self, originals: impl Iterator<Item = SandboxId>) -> Result<()> {
+        let mut candidate = *self;
+        for sandbox_id in originals {
+            if let Some(slot) = candidate
+                .slots
+                .iter_mut()
+                .flatten()
+                .find(|slot| slot.sandbox_id == sandbox_id)
+            {
+                slot.retired = false;
+            } else {
+                let slot = candidate
+                    .slots
+                    .iter_mut()
+                    .find(|slot| slot.is_none())
+                    .ok_or(OrchestratorError::FailedLaunchCleanupCapacity)?;
+                *slot = Some(CleanupProvenance {
+                    sandbox_id,
+                    retired: false,
+                });
+            }
+        }
+        *self = candidate;
+        Ok(())
+    }
+    fn mark_retired(&mut self, sandbox_id: SandboxId) -> Result<()> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|slot| slot.sandbox_id == sandbox_id)
+            .ok_or_else(|| {
+                OrchestratorError::InternalError("cleanup original provenance unavailable".into())
+            })?;
+        slot.retired = true;
+        Ok(())
+    }
+    fn retired(&self, sandbox_id: SandboxId) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|slot| slot.sandbox_id == sandbox_id && slot.retired)
+    }
 }
 
 /// Maximum time to wait for a sandbox to leave a transitional state.
@@ -103,10 +182,6 @@ impl FailedLaunchStage {
             Self::RunningPersisted => Some(SandboxState::Running),
         }
     }
-
-    fn should_detach_proxy_route(self) -> bool {
-        matches!(self, Self::RunningPersisted)
-    }
 }
 
 pub struct Orchestrator<
@@ -120,7 +195,13 @@ pub struct Orchestrator<
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
     template_build_ids: RwLock<HashSet<SandboxId>>,
     deletions: Mutex<HashMap<SandboxId, Arc<Mutex<DeleteProgress>>>>,
+    failed_launch_debts: RwLock<HashMap<SandboxId, FailedLaunchDebt>>,
+    failed_launch_cleanup: Mutex<()>,
+    cleanup_provenance: std::sync::Mutex<CleanupHistory>,
     proxy_routes: RwLock<ProxyRouteTable>,
+    native_create_incarnation: uuid::Uuid,
+    native_requester: Option<std::sync::Mutex<crate::sandbox::NativeIssuerRequester>>,
+    native_ingress: OnceCell<Arc<crate::sandbox::native_worker_ingress::IngressOwner>>,
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
     sandbox_metrics: Mutex<SandboxMetrics>,
@@ -187,6 +268,34 @@ where
         Self::new_inner(store, factory, persister, image_refs).await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn new_native_api_fixture(
+        store: S,
+        factory: F,
+        persister: P,
+    ) -> Result<Arc<Self>> {
+        // These API fixtures own no image artifacts: their backend is a mock
+        // and their authenticated actor peer is an in-memory pipe. Keep the
+        // real orchestrator initialization without opening the global image DB.
+        Self::new_inner(
+            store,
+            factory,
+            persister,
+            Arc::new(crate::image::cache::test_support::RecordingRuntimeImageRefs::default()),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn new_native_qualification_fixture(
+        store: S,
+        factory: F,
+        persister: P,
+        image_refs: Arc<dyn RuntimeImageRefs>,
+    ) -> Result<Arc<Self>> {
+        Self::new_inner(store, factory, persister, image_refs).await
+    }
+
     async fn new_inner(
         store: S,
         factory: F,
@@ -232,6 +341,23 @@ where
             store.add(metadata).await?;
         }
 
+        let native_create_incarnation = uuid::Uuid::now_v7();
+        let native_requester = if let Some(path) = &app_config.native_issuer_requester {
+            if !app_config.is_native_root() {
+                return Err(
+                    anyhow::anyhow!("native issuer requires explicit native-root mode").into(),
+                );
+            }
+            Some(std::sync::Mutex::new(
+                crate::sandbox::NativeIssuerRequester::install(
+                    path,
+                    native_create_incarnation,
+                    std::time::Instant::now() + Duration::from_secs(3),
+                )?,
+            ))
+        } else {
+            None
+        };
         let orchestrator = Arc::new(Self {
             store,
             factory,
@@ -239,7 +365,13 @@ where
             sandboxes: RwLock::new(HashMap::new()),
             template_build_ids: RwLock::new(HashSet::new()),
             deletions: Mutex::new(HashMap::new()),
+            failed_launch_debts: RwLock::new(HashMap::new()),
+            failed_launch_cleanup: Mutex::new(()),
+            cleanup_provenance: std::sync::Mutex::new(CleanupHistory::default()),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
+            native_create_incarnation,
+            native_requester,
+            native_ingress: OnceCell::new(),
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
             sandbox_metrics: Mutex::new(SandboxMetrics::default()),
@@ -252,6 +384,35 @@ where
             access_tokens,
             volume_manager,
         });
+
+        if app_config.native_worker_ingress {
+            let seed = {
+                orchestrator
+                    .native_requester
+                    .as_ref()
+                    .context("native ingress requires requester")?
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("native requester poisoned"))?
+                    .ingress_seed()?
+            }; // No requester mutex is held while bootstrap waits for Worker.
+            let owner = if app_config.native_worker_provision {
+                crate::sandbox::native_worker_ingress::IngressOwner::prepare_provisioned(
+                    seed,
+                    Arc::downgrade(&orchestrator),
+                )?
+            } else {
+                crate::sandbox::native_worker_ingress::IngressOwner::prepare(
+                    seed,
+                    Arc::downgrade(&orchestrator),
+                )?
+            };
+            orchestrator
+                .native_ingress
+                .set(owner.clone())
+                .map_err(|_| anyhow::anyhow!("native ingress already owned"))?;
+            owner.activate()?;
+            owner.wait_ready().await?;
+        }
 
         Self::start_metrics_task(&orchestrator);
 
@@ -387,6 +548,13 @@ where
             };
             running.push((sandbox_id, artifacts));
         }
+        running.extend(
+            self.failed_launch_debts
+                .read()
+                .await
+                .iter()
+                .map(|(id, debt)| (*id, debt.artifacts.clone())),
+        );
         running
     }
 
@@ -421,6 +589,443 @@ where
     /// This call only returns after the sandbox is fully ready and persisted
     /// as `Running`, so callers can treat a successful return as immediately
     /// usable without additional polling.
+    /// Reservations are original Worker authority receipts, not sandbox/READY claims.
+    /// The retained Orchestrator owns the synchronous intent and reciprocal peer.
+    pub fn native_reserve_original(
+        &self,
+        request: &[u8],
+        epoch: u64,
+        until: std::time::Instant,
+    ) -> anyhow::Result<crate::sandbox::ReservedGrant> {
+        anyhow::ensure!(
+            std::time::Instant::now() < until,
+            "late original reserve dispatch"
+        );
+        let mut requester = self
+            .native_requester
+            .as_ref()
+            .context("native issuer unavailable")?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native issuer owner poisoned"))?;
+        anyhow::ensure!(
+            std::time::Instant::now() < until,
+            "late original reserve owner admission"
+        );
+        requester.reserve_until(request, epoch, until)
+    }
+    pub fn native_query_original(
+        &self,
+        operation_id: &str,
+    ) -> anyhow::Result<crate::sandbox::ReservedGrant> {
+        self.native_requester
+            .as_ref()
+            .context("native issuer unavailable")?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native issuer owner poisoned"))?
+            .query(operation_id)
+    }
+
+    pub(crate) async fn native_execute_original(
+        self: &Arc<Self>,
+        original: crate::sandbox::native_worker_ingress::OriginalExecution<'_>,
+        permit: tokio::sync::OwnedRwLockReadGuard<()>,
+        commit: impl FnOnce(
+                &crate::sandbox::NativeControl,
+                [u8; 32],
+                &str,
+                String,
+                crate::sandbox::NativeControlRequest,
+                std::time::Instant,
+            ) -> anyhow::Result<serde_json::Value>
+            + Send,
+    ) -> anyhow::Result<(
+        crate::sandbox::native_worker_ingress::Completion,
+        Vec<u8>,
+        Vec<u8>,
+    )> {
+        let crate::sandbox::native_worker_ingress::OriginalExecution {
+            request,
+            epoch,
+            digest,
+            canonical,
+            sandbox,
+            peer_domain,
+        } = original;
+        use crate::sandbox::native_worker_ingress::{Completion, FixedLaunch};
+        use crate::sandbox::NativeControlRequest as Request;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use sha2::{Digest, Sha256};
+        let plan = FixedLaunch::parse(canonical).context("closed execution plan refused")?;
+        let expires = self
+            .native_requester
+            .as_ref()
+            .context("requester absent")?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("requester poisoned"))?
+            .original_execution_binding(request, epoch, digest, canonical, sandbox)?;
+        let control = self
+            .native_control_for(sandbox)
+            .await
+            .context("actual native control unavailable")?;
+        let mut domain = Sha256::new();
+        domain.update(b"scheduler-native-fixed-execution-v1");
+        domain.update(peer_domain);
+        domain.update(epoch.to_be_bytes());
+        let caller: [u8; 32] = domain.finalize().into();
+        let operation = digest.to_owned();
+        let native_epoch = control.epoch().to_owned();
+        anyhow::ensure!(
+            std::time::Instant::now() < expires,
+            "late execution admission"
+        );
+        let accepted = commit(
+            &control,
+            caller,
+            &native_epoch,
+            operation.clone(),
+            Request::Exec {
+                command: plan.plan.command.clone(),
+                args: plan.plan.args.clone(),
+                env: plan.plan.env.clone().into_iter().collect(),
+                cwd: Some(plan.plan.cwd.clone()),
+                timeout_ms: plan.plan.timeout_ms,
+            },
+            expires,
+        )?;
+        // Stop's original admission barrier may proceed only after keyed Exec
+        // admission is retained in this SAME actor.
+        drop(permit);
+        let session = accepted["session_id"]
+            .as_str()
+            .context("exec identity absent")?
+            .to_owned();
+        let exec_id = accepted["operation_id"]
+            .as_str()
+            .context("exec identity absent")?
+            .to_owned();
+        loop {
+            anyhow::ensure!(
+                std::time::Instant::now() < expires,
+                "execution observation expired"
+            );
+            let envelope = control
+                .dispatch(caller, &native_epoch, operation.clone(), Request::Query {})
+                .await?;
+            anyhow::ensure!(
+                envelope["epoch"].as_str() == Some(&native_epoch)
+                    && envelope["caller_operation_id"].as_str() == Some(&operation),
+                "execution route drift"
+            );
+            let status = envelope["result"].clone();
+            anyhow::ensure!(
+                status["session_id"].as_str() == Some(&session)
+                    && status["operation_id"].as_str() == Some(&exec_id),
+                "execution identity drift"
+            );
+            if status["terminal"] == true && status["process_absent"] == true {
+                let state = status["state"].as_str().context("terminal state absent")?;
+                let exit = status["exit_code"]
+                    .as_i64()
+                    .context("terminal exit absent")?;
+                anyhow::ensure!(
+                    (state == "succeeded" && exit == 0) || (state == "failed" && exit != 0),
+                    "non-business terminal"
+                );
+                let out = status["stdout_bytes"]
+                    .as_u64()
+                    .context("terminal length absent")?;
+                let err = status["stderr_bytes"]
+                    .as_u64()
+                    .context("terminal length absent")?;
+                anyhow::ensure!(
+                    out.checked_add(err).is_some_and(|n| n <= 65536),
+                    "legacy output budget"
+                );
+                let mut outputs = Vec::new();
+                for (stream, len) in [("stdout", out), ("stderr", err)] {
+                    let mut bytes = Vec::with_capacity(len as usize);
+                    while bytes.len() < len as usize {
+                        anyhow::ensure!(
+                            std::time::Instant::now() < expires,
+                            "output observation expired"
+                        );
+                        let value = control
+                            .dispatch(
+                                caller,
+                                &native_epoch,
+                                operation.clone(),
+                                Request::ExecRead {
+                                    stream: stream.into(),
+                                    offset: bytes.len(),
+                                    length: (len as usize - bytes.len()).min(2048),
+                                },
+                            )
+                            .await?;
+                        anyhow::ensure!(
+                            value["session_id"].as_str() == Some(&session)
+                                && value["operation_id"].as_str() == Some(&exec_id)
+                                && value["stream"].as_str() == Some(stream)
+                                && value["offset"].as_u64() == Some(bytes.len() as u64)
+                                && value["retained_bytes"].as_u64() == Some(len),
+                            "output identity drift"
+                        );
+                        let chunk =
+                            STANDARD.decode(value["data"].as_str().context("output missing")?)?;
+                        anyhow::ensure!(
+                            !chunk.is_empty()
+                                && chunk.len() <= 2048
+                                && bytes.len() + chunk.len() <= len as usize,
+                            "output bounds"
+                        );
+                        bytes.extend(chunk);
+                    }
+                    outputs.push(bytes);
+                }
+                let again = control
+                    .dispatch(caller, &native_epoch, operation.clone(), Request::Query {})
+                    .await?;
+                anyhow::ensure!(
+                    again["epoch"].as_str() == Some(&native_epoch)
+                        && again["caller_operation_id"].as_str() == Some(&operation)
+                        && again["result"] == status
+                        && std::time::Instant::now() < expires,
+                    "terminal changed or expired"
+                );
+                let stderr = outputs.pop().unwrap();
+                let stdout = outputs.pop().unwrap();
+                let receipt = Completion {
+                    plan_sha256: plan.plan_sha256,
+                    caller_sha256: caller.iter().map(|b| format!("{b:02x}")).collect(),
+                    native_epoch,
+                    route_epoch: control.route_epoch(),
+                    session_id: session,
+                    operation_id: exec_id,
+                    state: state.into(),
+                    exit_code: i32::try_from(exit)?,
+                    process_absent: true,
+                    terminal: true,
+                    acked_sequence: status["acked_sequence"]
+                        .as_u64()
+                        .context("terminal cursor absent")?,
+                    stdout_bytes: out,
+                    stderr_bytes: err,
+                    stdout_sha256: format!("{:x}", Sha256::digest(&stdout)),
+                    stderr_sha256: format!("{:x}", Sha256::digest(&stderr)),
+                };
+                return Ok((receipt, stdout, stderr));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    pub(crate) async fn native_cancel_fixed_execution(
+        &self,
+        sandbox: crate::types::SandboxId,
+        epoch: u64,
+        digest: &str,
+        peer_domain: [u8; 32],
+    ) -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        let control = self
+            .native_control_for(sandbox)
+            .await
+            .context("native control unavailable")?;
+        let mut domain = Sha256::new();
+        domain.update(b"scheduler-native-fixed-execution-v1");
+        domain.update(peer_domain);
+        domain.update(epoch.to_be_bytes());
+        let caller: [u8; 32] = domain.finalize().into();
+        let _ = control
+            .dispatch(
+                caller,
+                control.epoch(),
+                digest.to_owned(),
+                crate::sandbox::NativeControlRequest::Cancel {},
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn native_stop_original(
+        self: &Arc<Self>,
+        request: &[u8],
+        epoch: u64,
+        digest: &str,
+        until: std::time::Instant,
+    ) -> anyhow::Result<(Arc<crate::sandbox::NativeExecutionStopped>, String)> {
+        let binding = || -> anyhow::Result<_> {
+            self.native_requester
+                .as_ref()
+                .context("native requester unavailable")?
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native requester poisoned"))?
+                .original_stop_binding(request, epoch, digest)
+        };
+        let (id, cached, grant_sha) = binding()?;
+        if let Some(cached) = cached {
+            return Ok((cached, grant_sha));
+        }
+        anyhow::ensure!(std::time::Instant::now() < until, "original stop deadline");
+        // The ingress StopJob retains this entire future. No detached delete task,
+        // no timeout dropping physical cleanup and no new reservation.
+        let _cleanup = self
+            .delete_sandbox_inner_with_stop_until(id, Some(until))
+            .await;
+        let (_, stopped, grant_sha) = binding()?;
+        Ok((
+            stopped.context("original execution stop remains unknown")?,
+            grant_sha,
+        ))
+    }
+
+    /// Dispatches only a previously authenticated original Worker reservation.
+    /// HTTP callers cannot inject a grant or choose a new profile/SandboxId.
+    pub async fn native_launch_original(
+        self: &Arc<Self>,
+        operation_id: &str,
+        canonical_launch: &[u8],
+    ) -> Result<SandboxMetadata> {
+        let material = self
+            .native_requester
+            .as_ref()
+            .context("native issuer unavailable")?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native issuer owner poisoned"))?
+            .begin_launch(operation_id, canonical_launch, &self.factory)?;
+        let id = material.id;
+        let this = Arc::clone(self);
+        let operation_id = operation_id.to_owned();
+        self.run_cancellation_safe("native original create", id, async move {
+            let context = crate::snapshot::CommandContext {
+                user: Some("1000".into()),
+                workdir: "/workspace".into(),
+                ..Default::default()
+            };
+            let resources = crate::types::SandboxResources {
+                cpu_count: 1,
+                memory_mib: material.memory_mib,
+                disk_size_mib: 0,
+            };
+            let build = FreshSandboxBuildSpec {
+                image_config_path: material.rootfs_path,
+                context: context.clone(),
+                resources,
+                extra_drives: Vec::new(),
+                extra_boot_args: None,
+            };
+            let launch = SandboxLaunchConfig {
+                sandbox_id: id,
+                snapshot_id: material.rootfs_sha256.clone(),
+                ..Default::default()
+            };
+            let metadata = SandboxMetadata {
+                id,
+                snapshot_id: material.rootfs_sha256,
+                resources,
+                context,
+                virtualization_mode: ConfigManager::global_config().virtualization_mode,
+                runtime_versions: configured_runtime_versions(),
+                timeout_action: SandboxTimeoutAction::Delete,
+                ..Default::default()
+            };
+            let remaining = material
+                .expires
+                .checked_duration_since(std::time::Instant::now())
+                .context("native original Worker expired")?;
+            let plan = LaunchPlan::for_create_fresh(
+                id,
+                build,
+                launch,
+                metadata,
+                NewTimeout::Set(remaining),
+            );
+            let result = this
+                .launch_sandbox_owned(plan, Some((material.owner, material.expires)))
+                .await?;
+            let receipt = serde_json::to_vec(&result).context("native original Ready encode")?;
+            this.native_requester
+                .as_ref()
+                .unwrap()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native issuer owner poisoned"))?
+                .cache_ready(&operation_id, receipt)?;
+            Ok(result)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualification_native_original_expiry(
+        &self,
+        operation_id: &str,
+    ) -> Option<std::time::Instant> {
+        self.native_requester
+            .as_ref()?
+            .lock()
+            .ok()?
+            .qualification_original_expiry(operation_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualification_native_original_sandbox_id(
+        &self,
+        operation_id: &str,
+    ) -> Option<SandboxId> {
+        self.native_requester
+            .as_ref()?
+            .lock()
+            .ok()?
+            .original_sandbox_id(operation_id)
+            .map(SandboxId::from_uuid)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualification_native_original_owner(
+        &self,
+        operation_id: &str,
+    ) -> Option<SandboxHandle> {
+        self.native_requester
+            .as_ref()?
+            .lock()
+            .ok()?
+            .qualification_original_owner(operation_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn qualification_native_registered_owner(
+        &self,
+        id: SandboxId,
+    ) -> Option<SandboxHandle> {
+        self.sandboxes.read().await.get(&id).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualification_native_requester_retire_identity(&self) -> anyhow::Result<()> {
+        self.native_requester
+            .as_ref()
+            .context("native issuer unavailable")?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native issuer owner poisoned"))?
+            .retire_identity()
+    }
+
+    fn retire_native_original_owner(
+        &self,
+        id: SandboxId,
+        handle: &SandboxHandle,
+        stopped: Option<Arc<crate::sandbox::NativeExecutionStopped>>,
+    ) -> anyhow::Result<()> {
+        if let Some(requester) = &self.native_requester {
+            requester
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native requester poisoned"))?
+                .retire_backend_owner(id, handle, stopped)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn native_create_incarnation(&self) -> uuid::Uuid {
+        self.native_create_incarnation
+    }
+
     pub async fn create_sandbox(
         self: &Arc<Self>,
         request: CreateSandboxRequest,
@@ -868,7 +1473,16 @@ where
     /// Retrieves the metadata for a sandbox by its ID.
     #[tracing::instrument(skip(self), fields(sandbox_id = %sandbox_id))]
     pub async fn get_sandbox(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>> {
-        Ok(self.store.get(sandbox_id).await?)
+        if let Some(metadata) = self.store.get(sandbox_id).await? {
+            return Ok(Some(metadata));
+        }
+        Ok(self
+            .failed_launch_debts
+            .read()
+            .await
+            .values()
+            .find(|debt| &debt.sandbox_id == sandbox_id)
+            .and_then(|debt| debt.metadata.clone()))
     }
 
     /// Lists all sandboxes with their metadata.
@@ -884,6 +1498,13 @@ where
         // final template is publishing, even when no VM is currently running.
         let mut ids: HashSet<_> = self.store.list_ids().await?.into_iter().collect();
         ids.extend(self.template_build_ids.read().await.iter().copied());
+        ids.extend(
+            self.failed_launch_debts
+                .read()
+                .await
+                .values()
+                .map(|debt| debt.sandbox_id),
+        );
         Ok(ids.into_iter().collect())
     }
 
@@ -908,10 +1529,38 @@ where
         &self,
         filter: SandboxListFilter,
     ) -> Result<Vec<SandboxMetadata>> {
-        Ok(self
-            .store
-            .list_filtered(filter)
-            .await?
+        let mut metadata = self.store.list_filtered(filter.clone()).await?;
+        for debt in self.failed_launch_debts.read().await.values() {
+            if let Some(row) = &debt.metadata {
+                if !metadata.iter().any(|record| record.id == row.id)
+                    && filter
+                        .states
+                        .as_ref()
+                        .is_none_or(|states| states.contains(&row.state))
+                    && !filter
+                        .excluded_states
+                        .as_ref()
+                        .is_some_and(|states| states.contains(&row.state))
+                    && filter.user_metadata.as_ref().is_none_or(|required| {
+                        row.user_metadata.as_ref().is_some_and(|actual| {
+                            required
+                                .iter()
+                                .all(|(key, value)| actual.get(key) == Some(value))
+                        })
+                    })
+                    && filter
+                        .started_after
+                        .is_none_or(|after| row.created_at >= after)
+                    && filter.template.as_ref().is_none_or(|template| {
+                        row.snapshot_id == *template
+                            || row.snapshot_alias.as_deref() == Some(template.as_str())
+                    })
+                {
+                    metadata.push(row.clone());
+                }
+            }
+        }
+        Ok(metadata
             .into_iter()
             .filter(|metadata| !metadata.template_builder)
             .collect())
@@ -943,10 +1592,13 @@ where
                 version = route.version(),
                 "resolved running proxy target from runtime table"
             );
-            return Ok(ProxyLookupResult::Ready(route.target().clone()));
+            return Ok(match route.target() {
+                Some(target) => ProxyLookupResult::Ready(target.clone()),
+                None => ProxyLookupResult::NativeControl,
+            });
         }
 
-        let metadata = self.store.get(sandbox_id).await?;
+        let metadata = self.get_sandbox(sandbox_id).await?;
         Ok(match metadata {
             None => {
                 debug!("sandbox has no runtime route or persisted metadata");
@@ -1087,22 +1739,97 @@ where
         fields(sandbox_id = %sandbox_id)
     )]
     async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        self.delete_sandbox_inner_with_stop_until(sandbox_id, None)
+            .await
+    }
+
+    async fn delete_sandbox_inner_with_stop_until(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        stop_until: Option<std::time::Instant>,
+    ) -> Result<()> {
+        if let Some(ingress) = self.native_ingress.get() {
+            let operation = {
+                self.native_requester
+                    .as_ref()
+                    .context("native requester unavailable")?
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("native requester poisoned"))?
+                    .original_operation_for_sandbox(sandbox_id.into_inner())
+            };
+            if let Some(operation) = operation {
+                ingress
+                    .fence_original(
+                        &operation,
+                        stop_until
+                            .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(30)),
+                    )
+                    .await?;
+            }
+        }
         info!("deleting sandbox");
         let deletion = self.deletion_progress(sandbox_id).await;
         let mut progress = deletion.lock().await;
+        if stop_until.is_some_and(|until| std::time::Instant::now() >= until) {
+            return Err(OrchestratorError::InternalError(
+                "original stop admission deadline".into(),
+            ));
+        }
         match *progress {
             DeleteProgress::Done => return Ok(()),
             DeleteProgress::Capture => {}
             _ => {
                 return self
-                    .delete_sandbox_impl(sandbox_id, SandboxState::Killing, &mut progress)
+                    .delete_sandbox_impl(
+                        sandbox_id,
+                        SandboxState::Killing,
+                        &mut progress,
+                        stop_until,
+                    )
                     .await
             }
+        }
+        self.retry_failed_launch_debts(Some(sandbox_id)).await?;
+        if self.store.get(&sandbox_id).await?.is_none() {
+            let original_retired = self
+                .cleanup_provenance
+                .lock()
+                .map_err(|_| {
+                    OrchestratorError::InternalError("cleanup provenance lock unavailable".into())
+                })?
+                .retired(sandbox_id);
+            // A past owner retirement cannot acknowledge a replacement's absence.
+            let registry = self.sandboxes.read().await;
+            let debts = self.failed_launch_debts.read().await;
+            return if original_retired
+                && !registry.contains_key(&sandbox_id)
+                && !debts.values().any(|debt| debt.sandbox_id == sandbox_id)
+            {
+                Ok(())
+            } else {
+                Err(OrchestratorError::SandboxNotFound(sandbox_id))
+            };
         }
 
         // Attempt to transition to Killing, retrying after waiting whenever we
         // find the sandbox in a transitional state.
         let previous_state = loop {
+            // A terminal capture can hand off Stop while we waited for its
+            // state transition. Re-read the phase under this same mutex.
+            match *progress {
+                DeleteProgress::Done => return Ok(()),
+                DeleteProgress::Capture => {}
+                _ => {
+                    return self
+                        .delete_sandbox_impl(
+                            sandbox_id,
+                            SandboxState::Killing,
+                            &mut progress,
+                            stop_until,
+                        )
+                        .await
+                }
+            }
             match self
                 .store
                 .update_state_if_state(
@@ -1145,9 +1872,15 @@ where
                             state = ?actual_state,
                             "sandbox in transitional state, waiting before deletion"
                         );
-                        match self.wait_for_transition(sandbox_id, actual_state).await {
+                        // The capture owner needs this mutex to publish its
+                        // closed Stop handoff. Never wait on its state while
+                        // preventing that handoff from completing.
+                        drop(progress);
+                        let transition = self.wait_for_transition(sandbox_id, actual_state).await;
+                        progress = deletion.lock().await;
+                        match transition {
                             Ok(_) => {
-                                // Transition finished; retry the Killing CAS.
+                                // Recheck the handed-off phase before the CAS.
                                 continue;
                             }
                             Err(OrchestratorError::SandboxNotFound(_)) => {
@@ -1176,7 +1909,7 @@ where
             }
         };
 
-        self.delete_sandbox_impl(sandbox_id, previous_state, &mut progress)
+        self.delete_sandbox_impl(sandbox_id, previous_state, &mut progress, stop_until)
             .await
     }
 
@@ -1224,6 +1957,7 @@ where
         sandbox_id: SandboxId,
         previous_state: SandboxState,
         progress: &mut DeleteProgress,
+        stop_until: Option<std::time::Instant>,
     ) -> Result<()> {
         let metadata = self.store.get(&sandbox_id).await?;
         let optional_cache = metadata
@@ -1232,6 +1966,12 @@ where
         let volume_ids = metadata
             .map(|metadata| metadata.volume_mounts.into_values().collect::<Vec<_>>())
             .unwrap_or_default();
+        if stop_until.is_some_and(|until| std::time::Instant::now() >= until) {
+            return Err(OrchestratorError::InternalError(
+                "original stop dispatch deadline".into(),
+            ));
+        }
+        self.close_native_admission(sandbox_id).await;
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
         let mut capture_error = None;
 
@@ -1291,12 +2031,30 @@ where
 
         let cleanup: anyhow::Result<()> = async {
             if let DeleteProgress::Stop { capture_failed } = *progress {
-                if let Some(handle) = handle.as_ref() {
-                    handle.lock().await.stop().await?;
-                }
-                *progress = DeleteProgress::Release { capture_failed };
+                let retiring_native = if let Some(handle) = handle.as_ref() {
+                    let mut sandbox = handle.lock().await;
+                    if stop_until.is_some_and(|until| std::time::Instant::now() >= until) {
+                        anyhow::bail!("original stop physical dispatch deadline");
+                    }
+                    let artifacts = sandbox.runtime_info().runtime_artifacts;
+                    sandbox.stop().await?;
+                    let stopped = sandbox.native_execution_stopped();
+                    drop(sandbox);
+                    self.retire_native_original_owner(sandbox_id, handle, stopped)?;
+                    Some(artifacts)
+                } else {
+                    None
+                };
+                *progress = DeleteProgress::Release {
+                    capture_failed,
+                    retiring_native,
+                };
             }
-            if let DeleteProgress::Release { capture_failed } = *progress {
+            if let DeleteProgress::Release {
+                capture_failed,
+                retiring_native,
+            } = progress.clone()
+            {
                 if let Some(manager) = self.volume_manager.as_ref() {
                     let owner = sandbox_id.to_string();
                     // An incomplete restack may leave image.json pointing at old
@@ -1306,7 +2064,8 @@ where
                     }
                     manager.replace_owner_for(&owner, None, &volume_ids).await?;
                 }
-                self.remove_deleted_sandbox(sandbox_id).await?;
+                self.remove_deleted_sandbox(sandbox_id, retiring_native)
+                    .await?;
                 *progress = DeleteProgress::Done;
             }
             Ok(())
@@ -1316,6 +2075,17 @@ where
             if matches!(progress, DeleteProgress::Stop { .. }) {
                 if let Some(handle) = handle {
                     self.sandboxes.write().await.insert(sandbox_id, handle);
+                    // Stop failure is not proof of physical retirement. Preserve
+                    // the original native query capability without reopening
+                    // admission or changing the resumable Killing/Stop phase.
+                    if let Some(route) = removed_route.filter(|route| route.target().is_none()) {
+                        let mut routes = self.proxy_routes.write().await;
+                        if let Some(control) = route.native_control().cloned() {
+                            routes.publish_control(sandbox_id, control, route.version());
+                        } else {
+                            routes.publish_native(sandbox_id, route.version());
+                        }
+                    }
                 }
             }
             warn!(?error, "sandbox deletion needs a cleanup retry");
@@ -1335,7 +2105,11 @@ where
         Ok(())
     }
 
-    async fn remove_deleted_sandbox(&self, sandbox_id: SandboxId) -> Result<()> {
+    async fn remove_deleted_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        retiring_native: Option<RuntimeArtifactSet>,
+    ) -> Result<()> {
         let metadata = self.store.remove(&sandbox_id).await?;
         if let Some(metadata) = metadata {
             self.publish_sandbox_event(
@@ -1344,12 +2118,23 @@ where
                 metadata.resources,
             );
         }
-        if let Err(err) = self
+        let persistence_retired = match self
             .persister
             .delete_record_and_artifacts(&sandbox_id)
             .await
         {
-            warn!(error = ?err, "failed to delete persisted sandbox state");
+            Ok(()) => true,
+            Err(err) => {
+                warn!(error=?err,"failed to delete persisted sandbox state");
+                false
+            }
+        };
+        if persistence_retired {
+            if let Some(artifacts) = retiring_native {
+                self.image_refs
+                    .retire_native_running(sandbox_id, artifacts)
+                    .await?;
+            }
         }
         self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
             .await;
@@ -1380,7 +2165,17 @@ where
         let outcome = self
             .shutdown_outcome
             .get_or_init(|| async move {
-                ShutdownOutcome::from_result(this.run_shutdown_cleanup().await)
+                ShutdownOutcome::from_result(
+                    async {
+                        if let Some(ingress) = this.native_ingress.get() {
+                            ingress
+                                .seal(std::time::Instant::now() + Duration::from_secs(30))
+                                .await?;
+                        }
+                        this.run_shutdown_cleanup().await
+                    }
+                    .await,
+                )
             })
             .await;
 
@@ -1439,6 +2234,8 @@ where
     }
 
     async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        self.close_native_admission(sandbox_id).await;
+
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
@@ -1463,6 +2260,7 @@ where
                 .store
                 .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
                 .await;
+            self.reopen_native_admission(sandbox_id).await;
             return Err(error);
         }
 
@@ -1483,6 +2281,7 @@ where
                         &[SandboxState::Pausing],
                     )
                     .await;
+                self.reopen_native_admission(sandbox_id).await;
                 return Err(OrchestratorError::from(err));
             }
         };
@@ -1513,20 +2312,14 @@ where
                 warn!(error = ?err, "failed to pause sandbox");
                 if err.is_terminal() {
                     // The handle was already detached from `self.sandboxes`
-                    // before `pause()`. Do not reinsert it here: the live
-                    // runtime may have been mutated and is no longer safe to
-                    // keep serving as a running sandbox.
-                    let stop_result = {
-                        let mut sandbox = handle.lock().await;
-                        sandbox.stop().await
-                    };
-                    if let Err(stop_err) = stop_result {
-                        warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
+                    // before `pause()`. Its runtime may have been mutated; retain
+                    // it only in the closed Killing/Stop cleanup phase.
+                    if let Err(stop_err) = self
+                        .retire_terminal_capture(sandbox_id, &handle, removed_proxy_route)
+                        .await
+                    {
+                        warn!(error = ?stop_err, "terminal pause cleanup retained for retry");
                     }
-                    if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                        self.finalize_terminal_volumes(&metadata).await;
-                    }
-                    self.store.remove(&sandbox_id).await?;
                 } else {
                     self.sandboxes.write().await.insert(sandbox_id, handle);
                     self.restore_proxy_route(sandbox_id, removed_proxy_route)
@@ -1801,6 +2594,7 @@ where
                 error => OrchestratorError::from(error),
             })?;
 
+        self.close_native_admission(sandbox_id).await;
         if let Some(handle) = self.sandboxes.read().await.get(&sandbox_id).cloned() {
             return Ok(handle);
         }
@@ -1813,8 +2607,52 @@ where
         Err(OrchestratorError::SandboxNotFound(sandbox_id))
     }
 
+    // The lifecycle caller is cancellation-safe. Install the SAME backend and
+    // resumable Stop phase before cleanup; failure must not drop the last owner
+    // or publish the failed capture as Paused/Running. Admission stays closed.
+    async fn retire_terminal_capture(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        removed_route: Option<ProxyRoute>,
+    ) -> Result<()> {
+        // Preserve only the original closed native observation route. The
+        // recoverable restore helper would reopen admission and is forbidden.
+        let mut sandboxes = self.sandboxes.write().await;
+        sandboxes.insert(sandbox_id, Arc::clone(handle));
+        if let Some(route) = removed_route.filter(|route| route.target().is_none()) {
+            let mut routes = self.proxy_routes.write().await;
+            if let Some(control) = route.native_control().cloned() {
+                control.close_admission();
+                routes.publish_control(sandbox_id, control, route.version());
+            } else {
+                routes.publish_native(sandbox_id, route.version());
+            }
+        }
+        drop(sandboxes);
+        let deletion = self.deletion_progress(sandbox_id).await;
+        let mut progress = deletion.lock().await;
+        if !matches!(*progress, DeleteProgress::Capture) {
+            return Err(OrchestratorError::InternalError(
+                "terminal capture cleanup already owned".into(),
+            ));
+        }
+        *progress = DeleteProgress::Stop {
+            capture_failed: true,
+        };
+        self.store
+            .update_state_if_state(
+                &sandbox_id,
+                SandboxState::Killing,
+                &[SandboxState::Pausing, SandboxState::Snapshotting],
+            )
+            .await?;
+        self.delete_sandbox_impl(sandbox_id, SandboxState::Killing, &mut progress, None)
+            .await
+    }
+
     async fn fail_snapshot_operation<T>(
-        &self,
+        self: &Arc<Self>,
         sandbox_id: SandboxId,
         handle: &SandboxHandle,
         error: SandboxCaptureError,
@@ -1822,18 +2660,17 @@ where
     ) -> Result<T> {
         warn!(?error, ?operation, "sandbox snapshot operation failed");
         if error.is_terminal() {
-            self.detach_sandbox_handle_and_route(&sandbox_id).await;
-            if let Err(stop_error) = handle.lock().await.stop().await {
+            let (_, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+            if let Err(stop_error) = self
+                .retire_terminal_capture(sandbox_id, handle, removed_route)
+                .await
+            {
                 warn!(
                     ?stop_error,
                     ?operation,
-                    "failed to stop sandbox after terminal snapshot failure"
+                    "terminal snapshot cleanup retained for retry"
                 );
             }
-            if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                self.finalize_terminal_volumes(&metadata).await;
-            }
-            self.store.remove(&sandbox_id).await?;
         } else {
             let _ = self
                 .store
@@ -1843,6 +2680,7 @@ where
                     &[SandboxState::Snapshotting],
                 )
                 .await;
+            self.reopen_native_admission(sandbox_id).await;
         }
         Err(OrchestratorError::SandboxOperationFailed {
             sandbox_id,
@@ -1859,6 +2697,7 @@ where
                 &[SandboxState::Snapshotting],
             )
             .await?;
+        self.reopen_native_admission(sandbox_id).await;
         Ok(())
     }
 
@@ -1928,6 +2767,7 @@ where
             }
         };
 
+        self.reopen_native_admission(sandbox_id).await;
         info!("snapshot captured");
         Ok(SnapshotCaptureResult {
             metadata,
@@ -2291,8 +3131,13 @@ where
                 Ok(true) => match metadata.timeout_action {
                     SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
                     SandboxTimeoutAction::Delete => {
-                        self.delete_sandbox_impl(metadata.id, SandboxState::Running, &mut progress)
-                            .await
+                        self.delete_sandbox_impl(
+                            metadata.id,
+                            SandboxState::Running,
+                            &mut progress,
+                            None,
+                        )
+                        .await
                     }
                 }
                 .map(|_| true),
@@ -2398,6 +3243,13 @@ where
 
     #[tracing::instrument(skip(self, plan))]
     async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
+        self.launch_sandbox_owned(plan, None).await
+    }
+    async fn launch_sandbox_owned(
+        self: &Arc<Self>,
+        plan: LaunchPlan,
+        prepared: Option<(SandboxHandle, std::time::Instant)>,
+    ) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
 
         let sandbox_id = plan.sandbox_id();
@@ -2406,15 +3258,34 @@ where
         // Build and start the sandbox first, before making any state changes, so that we don't
         // have to roll back any persisted state if the build fails.
         // Meanwhile, the start process can be overlapped with the initial state persistence.
-        let mut sandbox = match self.build_sandbox(&plan) {
-            Ok(sandbox) => sandbox,
-            Err(err) => {
-                self.rollback_failed_launch_metadata(&plan, transitional_state)
-                    .await;
-                return Err(err);
+        let expiry = prepared.as_ref().map(|p| p.1);
+        let native_prepared = prepared.is_some();
+        let handle = if let Some((owner, _)) = prepared {
+            owner
+        } else {
+            match self.build_sandbox(&plan) {
+                Ok(sandbox) => Arc::new(Mutex::new(sandbox)),
+                Err(err) => {
+                    self.rollback_failed_launch_metadata(&plan, transitional_state)
+                        .await;
+                    return Err(err);
+                }
             }
         };
-
+        if native_prepared {
+            let mut registry = self.sandboxes.write().await;
+            if let std::collections::hash_map::Entry::Vacant(entry) = registry.entry(sandbox_id) {
+                entry.insert(handle.clone());
+            } else {
+                drop(registry);
+                self.retain_failed_launch_debt(&plan, handle, FailedLaunchStage::Registered)
+                    .await;
+                return Err(OrchestratorError::InternalError(
+                    "native original owner registration conflict".into(),
+                ));
+            }
+        }
+        let mut sandbox = handle.lock().await;
         // Protect artifacts before the backend opens them.
         let startup_artifacts = sandbox.startup_artifacts();
         if let Err(err) = self
@@ -2426,17 +3297,21 @@ where
             .await
         {
             warn!(error = %format_args!("{err:#}"), "failed to protect starting runtime artifacts");
+            drop(sandbox);
+            if native_prepared {
+                self.retain_failed_launch_debt(&plan, handle, FailedLaunchStage::Registered)
+                    .await;
+            }
             self.rollback_failed_launch_metadata(&plan, transitional_state)
                 .await;
             return Err(err);
         }
         if let Err(source) = sandbox.start_nowait().await {
             warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
-            if let Err(stop_err) = sandbox.stop().await {
-                warn!(error = %format_args!("{stop_err:#}"), "failed to stop sandbox after start failure");
-            }
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
+            drop(sandbox);
+            self.retain_unregistered_failed_launch_handle(&plan, handle.clone())
                 .await;
+            let _ = self.retry_failed_launch_debts(Some(sandbox_id)).await;
             return Err(OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
                 operation: SandboxOperation::Start,
@@ -2448,11 +3323,10 @@ where
         // If the orchestrator started shutting down, stop here before we persist any state.
         if self.is_shutting_down() {
             info!("orchestrator started shutting down just after starting the sandbox");
-            if let Err(err) = sandbox.stop().await {
-                warn!(error = %format_args!("{err:#}"), "failed to stop sandbox");
-            }
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
+            drop(sandbox);
+            self.retain_unregistered_failed_launch_handle(&plan, handle.clone())
                 .await;
+            let _ = self.retry_failed_launch_debts(Some(sandbox_id)).await;
             return Err(OrchestratorError::ShuttingDown);
         }
 
@@ -2465,15 +3339,27 @@ where
         });
 
         // Store the sandbox handle in memory.
-        let handle = Arc::new(Mutex::new(sandbox));
-        self.sandboxes
-            .write()
-            .await
-            .insert(sandbox_id, handle.clone());
+        drop(sandbox);
+        let registered = if native_prepared {
+            true
+        } else {
+            let mut registry = self.sandboxes.write().await;
+            if let std::collections::hash_map::Entry::Vacant(entry) = registry.entry(sandbox_id) {
+                entry.insert(Arc::clone(&handle));
+                true
+            } else {
+                false
+            }
+        };
+        if !registered {
+            self.retain_failed_launch_debt(&plan, handle, FailedLaunchStage::Registered)
+                .await;
+            return Err(OrchestratorError::InternalError(
+                "launch owner registration conflict; original owners retained".into(),
+            ));
+        }
 
-        self.release_image_refs(RuntimeImageOwner::StartingSandbox(sandbox_id))
-            .await;
-
+        // Keep startup protection until readiness and route publication succeed.
         // Persist the sandbox metadata if needed (during creation).
         if let Some(metadata) = transitional_metadata.as_ref() {
             if let Err(err) = self.store.add(metadata.clone()).await {
@@ -2516,7 +3402,35 @@ where
             return Err(OrchestratorError::ShuttingDown);
         }
 
-        let launch_timeout = plan.timeout();
+        // Running acquires the same capture before final metadata/publication or Starting release.
+        let running_artifacts = handle.lock().await.runtime_info().runtime_artifacts;
+        if let Err(error) = self
+            .image_refs
+            .promote_native_running(sandbox_id, running_artifacts)
+            .await
+        {
+            self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
+                .await;
+            return Err(OrchestratorError::from(error));
+        }
+        let launch_timeout = if let Some(until) = expiry {
+            match until.checked_duration_since(std::time::Instant::now()) {
+                Some(remaining) => NewTimeout::Set(remaining),
+                None => {
+                    self.cleanup_failed_launch(
+                        &plan,
+                        handle,
+                        FailedLaunchStage::TransitionalPersisted,
+                    )
+                    .await;
+                    return Err(OrchestratorError::InternalError(
+                        "native original Worker expiry before Ready publication".into(),
+                    ));
+                }
+            }
+        } else {
+            plan.timeout()
+        };
         let final_metadata = match self
             .store
             .update_if_state(
@@ -2541,21 +3455,36 @@ where
 
         let proxy_target = {
             let sandbox = handle.lock().await;
-            match Self::proxy_target_from_sandbox(sandbox.as_ref()) {
-                Ok(proxy_target) => proxy_target,
-                Err(err) => {
-                    warn!(error = %format_args!("{err:#}"), "sandbox became ready without a proxy target; rolling back launch");
-                    drop(sandbox);
-                    self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
+            if sandbox.native_control_ready() && sandbox.host_interaction_ip().is_none() {
+                None
+            } else {
+                match Self::proxy_target_from_sandbox(sandbox.as_ref()) {
+                    Ok(proxy_target) => Some(proxy_target),
+                    Err(err) => {
+                        warn!(error = %format_args!("{err:#}"), "sandbox became ready without a proxy target; rolling back launch");
+                        drop(sandbox);
+                        self.cleanup_failed_launch(
+                            &plan,
+                            handle,
+                            FailedLaunchStage::RunningPersisted,
+                        )
                         .await;
-                    return Err(err);
+                        return Err(err);
+                    }
                 }
             }
         };
-        if !self
-            .upsert_proxy_route_if_current_handle(sandbox_id, &handle, proxy_target)
-            .await
-        {
+        let published = match proxy_target {
+            Some(target) => {
+                self.upsert_proxy_route_if_current_handle(sandbox_id, &handle, target)
+                    .await
+            }
+            None => {
+                self.publish_native_control_if_current_handle(sandbox_id, &handle)
+                    .await
+            }
+        };
+        if !published {
             debug!("skipping runtime proxy route publication because sandbox handle is stale");
         }
 
@@ -2565,6 +3494,8 @@ where
             }
         }
 
+        self.release_image_refs(RuntimeImageOwner::StartingSandbox(sandbox_id))
+            .await;
         info!("sandbox launch completed");
         Ok(final_metadata)
     }
@@ -2595,38 +3526,280 @@ where
         })
     }
 
+    async fn retain_unregistered_failed_launch_handle(
+        &self,
+        plan: &LaunchPlan,
+        handle: SandboxHandle,
+    ) {
+        let sandbox_id = plan.sandbox_id();
+        // The cancellation-shielded launch task retains its local owner until
+        // this serialized publication installs registry, debt and metadata together.
+        let _cleanup = self.failed_launch_cleanup.lock().await;
+        self.retain_failed_launch_debt_locked(
+            plan,
+            Arc::clone(&handle),
+            FailedLaunchStage::TransitionalPersisted,
+        )
+        .await;
+        let mut registry = self.sandboxes.write().await;
+        let registered = match registry.entry(sandbox_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(handle);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => Arc::ptr_eq(entry.get(), &handle),
+        };
+        if !registered {
+            return;
+        }
+        // Resume already has Resuming metadata. Failed fresh start must retain
+        // Creating metadata so lookup cannot report absent while resources live.
+        if let Some(metadata) = plan.transitional_metadata() {
+            if let Err(error) = self.store.add(metadata.clone()).await {
+                warn!(error = %format_args!("{error:#}"), "failed to persist retained launch owner; cleanup debt remains in registry");
+            }
+        }
+    }
+
+    async fn retain_failed_launch_debt(
+        &self,
+        plan: &LaunchPlan,
+        handle: SandboxHandle,
+        stage: FailedLaunchStage,
+    ) {
+        let _cleanup = self.failed_launch_cleanup.lock().await;
+        self.retain_failed_launch_debt_locked(plan, handle, stage)
+            .await;
+    }
+
+    fn failed_debt_image_owner(
+        debt: SandboxId,
+        original: SandboxId,
+        artifacts: &RuntimeArtifactSet,
+    ) -> RuntimeImageOwner {
+        if artifacts.has_native() {
+            RuntimeImageOwner::NativeFailedLaunchDebt { debt, original }
+        } else {
+            RuntimeImageOwner::StartingSandbox(debt)
+        }
+    }
+    // Caller holds failed_launch_cleanup across this and any registry publication.
+    async fn retain_failed_launch_debt_locked(
+        &self,
+        plan: &LaunchPlan,
+        handle: SandboxHandle,
+        stage: FailedLaunchStage,
+    ) {
+        let artifacts = {
+            let sandbox = handle.lock().await;
+            sandbox
+                .startup_artifacts()
+                .union(sandbox.runtime_info().runtime_artifacts)
+        };
+        let fallback_metadata = if let Some(metadata) = plan.transitional_metadata() {
+            Some(metadata.clone())
+        } else {
+            self.store.get(&plan.sandbox_id()).await.ok().flatten()
+        };
+        let mut debts = self.failed_launch_debts.write().await;
+        if debts
+            .values()
+            .any(|debt| Arc::ptr_eq(&debt.handle, &handle))
+        {
+            return;
+        }
+        let id = loop {
+            let id = SandboxId::new();
+            if !debts.contains_key(&id) {
+                break id;
+            }
+        };
+        debts.insert(
+            id,
+            FailedLaunchDebt {
+                sandbox_id: plan.sandbox_id(),
+                handle: Arc::clone(&handle),
+                metadata: fallback_metadata,
+                create: matches!(plan, LaunchPlan::Create(_)),
+                expected_state: stage.rollback_expected_state(plan),
+                pin_ready: false,
+                artifacts: artifacts.clone(),
+            },
+        );
+        drop(debts);
+        let pin_ready = self
+            .protect_image_refs(
+                Self::failed_debt_image_owner(id, plan.sandbox_id(), &artifacts),
+                artifacts,
+                "failed launch debt",
+            )
+            .await
+            .is_ok();
+        if !pin_ready {
+            warn!("debt protection unresolved; retaining original owner and startup references");
+        }
+        if let Some(debt) = self.failed_launch_debts.write().await.get_mut(&id) {
+            debt.pin_ready = pin_ready;
+        }
+    }
+
+    /// One finite stop attempt per retained original owner, including displaced
+    /// handles. No registry replacement or shared rollback is allowed for a stale owner.
+    async fn retry_failed_launch_debts(&self, selected: Option<SandboxId>) -> Result<()> {
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let _cleanup = tokio::time::timeout_at(until, self.failed_launch_cleanup.lock())
+            .await
+            .map_err(|_| OrchestratorError::InternalError("failed launch cleanup busy".into()))?;
+        let debts: Vec<_> = self
+            .failed_launch_debts
+            .read()
+            .await
+            .iter()
+            .filter(|(_, debt)| selected.is_none_or(|id| id == debt.sandbox_id))
+            .map(|(id, debt)| (*id, debt.clone()))
+            .collect();
+        self.cleanup_provenance
+            .lock()
+            .map_err(|_| {
+                OrchestratorError::InternalError("cleanup provenance lock unavailable".into())
+            })?
+            .reserve(debts.iter().map(|(_, debt)| debt.sandbox_id))?;
+        let mut unresolved = false;
+        for (id, debt) in debts {
+            if !debt.pin_ready {
+                let protected = tokio::time::timeout_at(until, async {
+                    self.protect_image_refs(
+                        Self::failed_debt_image_owner(id, debt.sandbox_id, &debt.artifacts),
+                        debt.artifacts.clone(),
+                        "failed launch debt retry",
+                    )
+                    .await
+                })
+                .await;
+                if !matches!(protected, Ok(Ok(()))) {
+                    unresolved = true;
+                    continue;
+                }
+                if let Some(current) = self.failed_launch_debts.write().await.get_mut(&id) {
+                    current.pin_ready = true;
+                }
+            }
+            let result = tokio::time::timeout_at(until, async {
+                let mut backend = debt.handle.lock().await;
+                backend.stop().await?;
+                Ok::<_, anyhow::Error>(backend.native_execution_stopped())
+            })
+            .await;
+            let stopped = match result {
+                Ok(Ok(stopped)) => stopped,
+                _ => {
+                    unresolved = true;
+                    continue;
+                }
+            };
+            if self
+                .retire_native_original_owner(debt.sandbox_id, &debt.handle, stopped)
+                .is_err()
+            {
+                unresolved = true;
+                continue;
+            }
+            let mut registry = self.sandboxes.write().await;
+            let current = {
+                match registry.get(&debt.sandbox_id) {
+                    Some(handle) if Arc::ptr_eq(handle, &debt.handle) => true,
+                    Some(_) | None => false,
+                }
+            };
+            let metadata = self.store.get(&debt.sandbox_id).await?;
+            let owns_metadata = metadata.as_ref().is_none_or(|metadata| {
+                debt.metadata.as_ref().is_some_and(|original| {
+                    original.created_at == metadata.created_at
+                        && original.snapshot_id == metadata.snapshot_id
+                })
+            });
+            let mut deleted_original =
+                current && owns_metadata && debt.create && metadata.is_none();
+            if current && owns_metadata {
+                self.proxy_routes.write().await.remove(&debt.sandbox_id);
+                if let Some(metadata) = metadata {
+                    if debt.create
+                        && debt
+                            .expected_state
+                            .is_none_or(|expected| metadata.state == expected)
+                    {
+                        self.store.remove(&debt.sandbox_id).await?;
+                        deleted_original = true;
+                    } else if !debt.create {
+                        if let Some(expected) = debt.expected_state {
+                            self.store
+                                .update_state_if_state(
+                                    &debt.sandbox_id,
+                                    SandboxState::Paused,
+                                    &[expected],
+                                )
+                                .await?;
+                            self.persister.rollback_resuming(&debt.sandbox_id).await?;
+                        }
+                    }
+                }
+                self.image_refs
+                    .retire_native_running(debt.sandbox_id, debt.artifacts.clone())
+                    .await?;
+                self.release_image_refs(RuntimeImageOwner::StartingSandbox(debt.sandbox_id))
+                    .await;
+            }
+            if current {
+                registry.remove(&debt.sandbox_id);
+            }
+            drop(registry);
+            // The unique debt pin is independent of any replacement's image owner.
+            self.failed_launch_debts.write().await.remove(&id);
+            self.release_image_refs(Self::failed_debt_image_owner(
+                id,
+                debt.sandbox_id,
+                &debt.artifacts,
+            ))
+            .await;
+            // No other original owner for this ID may remain. Record completion
+            // only after this real stop/metadata/persistence/pin retirement.
+            let remaining = self.failed_launch_debts.read().await;
+            if deleted_original
+                && !debt.artifacts.has_native()
+                && !remaining
+                    .values()
+                    .any(|other| other.sandbox_id == debt.sandbox_id)
+                && !self.sandboxes.read().await.contains_key(&debt.sandbox_id)
+                && self.store.get(&debt.sandbox_id).await?.is_none()
+            {
+                self.cleanup_provenance
+                    .lock()
+                    .map_err(|_| {
+                        OrchestratorError::InternalError(
+                            "cleanup provenance lock unavailable".into(),
+                        )
+                    })?
+                    .mark_retired(debt.sandbox_id)?;
+            }
+        }
+        if unresolved {
+            return Err(OrchestratorError::InternalError(
+                "failed launch cleanup debt unresolved".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn cleanup_failed_launch(
         &self,
         plan: &LaunchPlan,
         handle: SandboxHandle,
         stage: FailedLaunchStage,
     ) {
-        let should_rollback_shared_state = self
-            .detach_launch_runtime_if_current(
-                &plan.sandbox_id(),
-                &handle,
-                stage.should_detach_proxy_route(),
-                stage,
-            )
+        self.retain_failed_launch_debt(plan, handle, stage).await;
+        let _ = self
+            .retry_failed_launch_debts(Some(plan.sandbox_id()))
             .await;
-
-        // Stop the sandbox.
-        let stop_result = {
-            let mut sandbox = handle.lock().await;
-            sandbox.stop().await
-        };
-        if let Err(err) = stop_result {
-            warn!(error = %format_args!("{err:#}"), "failed to stop sandbox while rolling back launch");
-        }
-
-        if !should_rollback_shared_state {
-            return;
-        }
-
-        if let Some(expected_state) = stage.rollback_expected_state(plan) {
-            self.rollback_failed_launch_metadata(plan, expected_state)
-                .await;
-        }
     }
 
     async fn rollback_failed_launch_metadata(
@@ -2661,39 +3834,6 @@ where
         }
     }
 
-    async fn detach_launch_runtime_if_current(
-        &self,
-        sandbox_id: &SandboxId,
-        handle: &SandboxHandle,
-        detach_proxy_route: bool,
-        stage: FailedLaunchStage,
-    ) -> bool {
-        let mut sandboxes = self.sandboxes.write().await;
-        let Some(current_handle) = sandboxes.get(sandbox_id) else {
-            return true;
-        };
-
-        if !Arc::ptr_eq(current_handle, handle) {
-            warn!(
-                stage = ?stage,
-                "sandbox handle was replaced during failed launch cleanup; skipping shared state rollback"
-            );
-            return false;
-        }
-
-        sandboxes.remove(sandbox_id);
-
-        if detach_proxy_route {
-            let removed_route = self.proxy_routes.write().await.remove(sandbox_id);
-            if let Some(route) = removed_route.as_ref() {
-                debug!(version = route.version(), "removed runtime proxy route");
-            }
-        }
-
-        drop(sandboxes);
-        true
-    }
-
     fn proxy_target_from_sandbox(sandbox: &dyn SandboxBackend) -> Result<ProxyTarget> {
         sandbox
             .host_interaction_ip()
@@ -2718,7 +3858,7 @@ where
         debug!(
             version = route.version(),
             updated_at = ?route.updated_at(),
-            host_interaction_ip = %route.target().ip,
+            host_interaction_ip = ?route.target().map(|target| target.ip),
             "updated runtime proxy route"
         );
     }
@@ -2753,7 +3893,7 @@ where
         debug!(
             version = route.version(),
             updated_at = ?route.updated_at(),
-            host_interaction_ip = %route.target().ip,
+            host_interaction_ip = ?route.target().map(|target| target.ip),
             "updated runtime proxy route"
         );
         true
@@ -2763,8 +3903,97 @@ where
         let Some(route) = route else {
             return;
         };
-        self.upsert_proxy_route(sandbox_id, route.target().clone())
-            .await;
+        match route.target() {
+            Some(target) => self.upsert_proxy_route(sandbox_id, target.clone()).await,
+            None => {
+                let mut routes = self.proxy_routes.write().await;
+                if let Some(control) = route.native_control().cloned() {
+                    if control.reopen_admission().is_ok() {
+                        routes.publish_control(sandbox_id, control, route.version());
+                    }
+                } else {
+                    routes.publish_native(sandbox_id, route.version());
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn native_control_for(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<crate::sandbox::NativeControl> {
+        let state = self.store.get(&sandbox_id).await.ok().flatten()?.state;
+        if !matches!(state, SandboxState::Running | SandboxState::Killing) {
+            return None;
+        }
+        // Killing exposes only an explicitly retained original actor. Deletion
+        // sealed its admission before Stop; restoration never reopens it.
+        let control = self.registered_native_control(sandbox_id).await?;
+        control.available().then_some(control)
+    }
+    async fn registered_native_control(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<crate::sandbox::NativeControl> {
+        let sandboxes = self.sandboxes.read().await;
+        if !sandboxes.contains_key(&sandbox_id) {
+            return None;
+        }
+        self.proxy_routes
+            .read()
+            .await
+            .route(&sandbox_id)?
+            .native_control()
+            .cloned()
+    }
+    async fn close_native_admission(&self, sandbox_id: SandboxId) {
+        if let Some(control) = self.registered_native_control(sandbox_id).await {
+            control.close_admission();
+            return;
+        }
+        // Running persistence can precede route publication. Close the same
+        // backend actor even in that interval so late publication cannot open it.
+        let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
+        if let Some(handle) = handle {
+            if let Some(control) = handle.lock().await.native_control() {
+                control.close_admission();
+            }
+        }
+    }
+    async fn reopen_native_admission(&self, sandbox_id: SandboxId) {
+        if let Some(control) = self.registered_native_control(sandbox_id).await {
+            let _ = control.reopen_admission();
+        }
+    }
+
+    async fn publish_native_control_if_current_handle(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+    ) -> bool {
+        let control = handle.lock().await.native_control();
+        let registry = self.sandboxes.read().await;
+        if !registry
+            .get(&sandbox_id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            return false;
+        }
+        let version = self
+            .next_proxy_route_version
+            .fetch_add(1, Ordering::Relaxed);
+        let mut routes = self.proxy_routes.write().await;
+        if let Some(control) = control {
+            let Ok(control) = control.publish(version) else {
+                return false;
+            };
+            routes.publish_control(sandbox_id, control, version);
+        } else {
+            // Existing non-native test backends may expose only the old boolean;
+            // this route does not grant a public control capability.
+            routes.publish_native(sandbox_id, version);
+        }
+        true
     }
 
     async fn detach_sandbox_handle_and_route(
@@ -2778,6 +4007,9 @@ where
 
         let removed_route = self.proxy_routes.write().await.remove(sandbox_id);
         if let Some(route) = removed_route.as_ref() {
+            if let Some(control) = route.native_control() {
+                control.close_admission();
+            }
             debug!(version = route.version(), "removed runtime proxy route");
         }
 
@@ -2787,6 +4019,18 @@ where
 
     async fn run_shutdown_cleanup(self: &Arc<Self>) -> Result<()> {
         const MAX_SHUTDOWN_PASSES: usize = 3;
+        // Debt cleanup is independent from metadata visibility and ordinary
+        // preservation; never shut down networking while these owners remain.
+        for _ in 0..MAX_SHUTDOWN_PASSES {
+            if self.retry_failed_launch_debts(None).await.is_ok() {
+                break;
+            }
+        }
+        if !self.failed_launch_debts.read().await.is_empty() {
+            return Err(OrchestratorError::InternalError(
+                "shutdown retains unresolved failed launch debt".into(),
+            ));
+        }
         let mut last_failures = Vec::new();
 
         // Preserve recoverable sandboxes by pausing running VMs before process exit.
@@ -2976,6 +4220,46 @@ where
     F: SandboxBackendFactory,
     P: SandboxPersister + 'static,
 {
+    pub(crate) async fn publish_native_control_for_test(
+        &self,
+        id: SandboxId,
+        control: crate::sandbox::NativeControl,
+    ) -> bool {
+        self.set_metadata_state_for_test(id, SandboxState::Running)
+            .await
+            .unwrap();
+        let backend = crate::sandbox::mock::MockSandboxBackend::new_with_native_control(
+            Arc::new(crate::sandbox::mock::MockBehavior::new()),
+            control,
+        );
+        let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(backend)));
+        self.sandboxes.write().await.insert(id, handle.clone());
+        self.publish_native_control_if_current_handle(id, &handle)
+            .await
+    }
+    #[cfg(test)]
+    pub(crate) async fn set_native_control_for_test(
+        &self,
+        id: SandboxId,
+        control: crate::sandbox::NativeControl,
+    ) -> Arc<crate::sandbox::mock::MockBehavior> {
+        self.set_metadata_state_for_test(id, SandboxState::Running)
+            .await
+            .unwrap();
+        let behavior = Arc::new(crate::sandbox::mock::MockBehavior::new());
+        let backend = crate::sandbox::mock::MockSandboxBackend::new(behavior.clone());
+        self.sandboxes
+            .write()
+            .await
+            .insert(id, Arc::new(Mutex::new(Box::new(backend))));
+        let epoch = control.route_epoch();
+        self.proxy_routes
+            .write()
+            .await
+            .publish_control(id, control, epoch);
+        behavior
+    }
+    #[cfg(test)]
     pub(crate) async fn set_proxy_target_for_test(
         &self,
         sandbox_id: SandboxId,

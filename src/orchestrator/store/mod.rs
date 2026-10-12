@@ -1,6 +1,7 @@
 mod in_memory;
 mod metadata;
 
+use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -64,48 +65,117 @@ impl SandboxListFilter {
 
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
-    async fn add(&self, metadata: SandboxMetadata) -> Result<()>;
-    async fn update(&self, metadata: SandboxMetadata) -> Result<()>;
+    fn add<'life0, 'async_trait>(
+        &'life0 self,
+        metadata: SandboxMetadata,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
+    fn update<'life0, 'async_trait>(
+        &'life0 self,
+        metadata: SandboxMetadata,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
     /// Updates the sandbox state to `new_state` if the current state is one of `expected_states`.
     /// Returns the PREVIOUS sandbox state on success.
-    async fn update_state_if_state(
-        &self,
-        sandbox_id: &SandboxId,
+    fn update_state_if_state<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        sandbox_id: &'life1 SandboxId,
         new_state: SandboxState,
-        expected_states: &[SandboxState],
-    ) -> Result<SandboxState>;
+        expected_states: &'life2 [SandboxState],
+    ) -> BoxFuture<'async_trait, Result<SandboxState>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait;
     /// Atomically updates sandbox metadata using the latest stored value if the
     /// current state is one of `expected_states`.
     ///
     /// The update callback is synchronous by design: store implementations may
     /// run it while holding their metadata lock, so callers must not perform
     /// async work inside the callback.
-    async fn update_if_state<F>(
-        &self,
-        sandbox_id: &SandboxId,
-        expected_states: &[SandboxState],
+    fn update_if_state<'life0, 'life1, 'life2, 'async_trait, F>(
+        &'life0 self,
+        sandbox_id: &'life1 SandboxId,
+        expected_states: &'life2 [SandboxState],
         update: F,
-    ) -> Result<MetadataUpdateResult>
+    ) -> BoxFuture<'async_trait, Result<MetadataUpdateResult>>
     where
-        F: FnOnce(&mut SandboxMetadata) + Send;
-    async fn get(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>>;
-    async fn remove(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>>;
-    async fn list(&self) -> Result<Vec<SandboxMetadata>>;
-    async fn list_with_callback<F>(&self, callback: F) -> Result<()>
+        F: FnOnce(&mut SandboxMetadata) + Send,
+        F: 'async_trait,
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait;
+    fn get<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        sandbox_id: &'life1 SandboxId,
+    ) -> BoxFuture<'async_trait, Result<Option<SandboxMetadata>>>
     where
-        F: FnMut(&SandboxMetadata) + Send;
-    async fn list_filtered(&self, filter: SandboxListFilter) -> Result<Vec<SandboxMetadata>>;
-    async fn list_expired(&self, now: SystemTime) -> Result<Vec<SandboxMetadata>>;
-    async fn list_ids(&self) -> Result<Vec<SandboxId>>;
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
+    fn remove<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        sandbox_id: &'life1 SandboxId,
+    ) -> BoxFuture<'async_trait, Result<Option<SandboxMetadata>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
+    fn list<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> BoxFuture<'async_trait, Result<Vec<SandboxMetadata>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
+    fn list_with_callback<'life0, 'async_trait, F>(
+        &'life0 self,
+        callback: F,
+    ) -> BoxFuture<'async_trait, Result<()>>
+    where
+        F: FnMut(&SandboxMetadata) + Send,
+        F: 'async_trait,
+        'life0: 'async_trait,
+        Self: 'async_trait;
+    fn list_filtered<'life0, 'async_trait>(
+        &'life0 self,
+        filter: SandboxListFilter,
+    ) -> BoxFuture<'async_trait, Result<Vec<SandboxMetadata>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
+    fn list_expired<'life0, 'async_trait>(
+        &'life0 self,
+        now: SystemTime,
+    ) -> BoxFuture<'async_trait, Result<Vec<SandboxMetadata>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
+    fn list_ids<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> BoxFuture<'async_trait, Result<Vec<SandboxId>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Waits until the sandbox state is no longer any of the given `transitional_states`,
     /// then returns the latest metadata.
     ///
     /// Returns `Ok(None)` if the sandbox was removed while waiting.
     /// Returns immediately (without blocking) if the sandbox is already in a non-transitional state.
-    async fn wait_while_in_states(
-        &self,
-        sandbox_id: &SandboxId,
-        transitional_states: &[SandboxState],
-    ) -> Result<Option<SandboxMetadata>>;
+    fn wait_while_in_states<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        sandbox_id: &'life1 SandboxId,
+        transitional_states: &'life2 [SandboxState],
+    ) -> BoxFuture<'async_trait, Result<Option<SandboxMetadata>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait;
 }

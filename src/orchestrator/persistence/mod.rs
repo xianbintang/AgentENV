@@ -3,6 +3,7 @@ mod file_backed;
 mod mock;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use std::path::{Path, PathBuf};
 
 use crate::orchestrator::store::SandboxMetadata;
@@ -62,38 +63,83 @@ impl SandboxPersistenceError {
 /// Persistence interface for sandbox records and artifacts.
 pub trait SandboxPersister: Send + Sync {
     /// Load all persisted sandbox metadata.
-    async fn load_all<F>(&self, factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
+    fn load_all<'life0, 'life1, 'async_trait, F>(
+        &'life0 self,
+        factory: &'life1 F,
+    ) -> BoxFuture<'async_trait, PersistenceResult<Vec<SandboxMetadata>>>
     where
-        F: SandboxBackendFactory;
+        F: SandboxBackendFactory,
+        F: 'async_trait,
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Allocate an UNIQUE directory for sandbox artifacts.
     ///
     /// `None` means persistence is disabled and the sandbox backend should manage
     /// the lifecycle of its temporary artifacts.
-    async fn allocate_artifact_root(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> PersistenceResult<Option<PathBuf>>;
+    fn allocate_artifact_root<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        sandbox_id: &'life1 SandboxId,
+    ) -> BoxFuture<'async_trait, PersistenceResult<Option<PathBuf>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Persist metadata and runtime state for a paused sandbox.
-    async fn persist_paused(
-        &self,
-        metadata: &SandboxMetadata,
-        artifact_root: Option<&Path>,
-        paused_state: &dyn PausedSandboxState,
-    ) -> PersistenceResult<()>;
+    fn persist_paused<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        metadata: &'life1 SandboxMetadata,
+        artifact_root: Option<&'life2 Path>,
+        paused_state: &'life3 dyn PausedSandboxState,
+    ) -> BoxFuture<'async_trait, PersistenceResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait;
 
     /// Mark a paused sandbox as resuming.
-    async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+    fn mark_resuming<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        sandbox_id: &'life1 SandboxId,
+    ) -> BoxFuture<'async_trait, PersistenceResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Roll back a resuming mark after a failed resume attempt.
-    async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+    fn rollback_resuming<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        sandbox_id: &'life1 SandboxId,
+    ) -> BoxFuture<'async_trait, PersistenceResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Delete the persistence record for a sandbox.
-    async fn delete_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+    fn delete_record<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        sandbox_id: &'life1 SandboxId,
+    ) -> BoxFuture<'async_trait, PersistenceResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Delete the persistence record and all associated artifacts.
-    async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+    fn delete_record_and_artifacts<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        sandbox_id: &'life1 SandboxId,
+    ) -> BoxFuture<'async_trait, PersistenceResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 }
 
 #[derive(Default)]

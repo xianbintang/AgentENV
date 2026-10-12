@@ -9,9 +9,12 @@ mod connector;
 mod factory;
 mod instance;
 mod mmds;
+pub(crate) mod native_guest;
 mod overlaybd_snapshot;
 mod pool;
 mod process_vm_reader;
+#[cfg(all(test, target_os = "linux"))]
+mod qualification_native;
 mod sandbox;
 mod socket;
 mod startup_pack;
@@ -23,5 +26,8 @@ pub use config::{
 pub use factory::FirecrackerSandboxFactory;
 pub(super) use instance::FirecrackerInstance;
 pub use pool::FirecrackerPool;
-pub use sandbox::{FirecrackerCaptureArtifacts, FirecrackerPausedState, FirecrackerSandbox};
+pub use sandbox::{
+    FirecrackerCaptureArtifacts, FirecrackerPausedState, FirecrackerSandbox,
+    NativeExecutionStopped, NativeNetworkDisposition,
+};
 pub(crate) use startup_pack::record_startup_pack;

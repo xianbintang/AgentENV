@@ -22,6 +22,153 @@
 
 set -euo pipefail
 export LC_ALL=C
+# Opt-in native-root is deliberately separate from the existing aenv installer.
+native_root_inputs() {
+    NATIVE_HOME="${AENV_HOME_PATH:-/var/lib/aenv-native-root}"
+    NATIVE_PROFILE="${AENV_NATIVE_PROFILE:-}"
+    NATIVE_VMM="${AENV_NATIVE_VMM:-}"
+    if [[ "${AENV_SERVICE_USER:-root}" != root || "${AENV_SERVICE_GROUP:-root}" != root || "${AENV_VIRTUALIZATION_MODE:-kvm}" != kvm ]]; then
+        echo "error: native-root fixes root:root and KVM" >&2; return 1
+    fi
+    for path in "$NATIVE_HOME" "$NATIVE_PROFILE" "$NATIVE_VMM"; do
+        if [[ ! "$path" =~ ^/[a-zA-Z0-9_./-]+$ || "$path" == *'/../'* || "$path" == *'/./'* || "$path" == / || "$path" == */ || "$path" == */.. || "$path" == */. ]]; then
+            echo "error: native-root requires explicit safe home/profile/VMM paths" >&2; return 1
+        fi
+    done
+    if [[ "$NATIVE_HOME" == /var/lib/aenv || "$NATIVE_HOME" == /run/aenv || "$NATIVE_HOME" == "$NATIVE_PROFILE" || "$NATIVE_PROFILE" == "$NATIVE_HOME/"* ]]; then
+        echo "error: native-root requires separate profile and state namespaces" >&2; return 1
+    fi
+}
+render_native_root_service() {
+    cat <<'UNIT'
+[Unit]
+Description=AgentENV Native Root (fresh native profile only)
+After=network.target
+[Service]
+User=root
+Group=root
+SupplementaryGroups=kvm
+EnvironmentFile=/etc/default/aenv-native-root
+ExecStart=/usr/local/libexec/aenv-native-root/server
+RuntimeDirectory=aenv-native-root
+RuntimeDirectoryMode=0700
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+SecureBits=noroot noroot-locked
+NoNewPrivileges=true
+UMask=0077
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+Restart=no
+KillMode=process
+TimeoutStopSec=30
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+render_native_root_config() {
+    cat <<CONFIG
+# Explicit protected native-only root deployment; no legacy effect APIs.
+deployment_mode = "native-root"
+home_path = "$NATIVE_HOME"
+runtime_path = "/run/aenv-native-root"
+virtualization_mode = "kvm"
+[firecracker]
+native_guest_profile = "$NATIVE_PROFILE"
+binary_path = "$NATIVE_VMM"
+work_dir = "$NATIVE_HOME/work"
+serial_dir = "$NATIVE_HOME/logs"
+[backend.posix_fs]
+snapshot_store = "$NATIVE_HOME/snapshot-store"
+[orchestrator]
+persisted_sandbox_store_path = "$NATIVE_HOME/state/sandboxes.json"
+[snapshot]
+local_cache_path = "$NATIVE_HOME/snapshot-local-cache"
+p2p_enabled = false
+[p2p]
+enabled = false
+[observability]
+enabled = false
+[pool]
+low_watermark = 0
+high_watermark = 0
+[pool.network]
+enabled = false
+maintenance_enabled = false
+startup_prewarm = false
+[pool.block]
+enabled = false
+maintenance_enabled = false
+startup_prewarm = false
+[pool.firecracker]
+enabled = false
+maintenance_enabled = false
+startup_prewarm = false
+[memory_snapshot]
+track_dirty_pages = false
+CONFIG
+}
+native_root_protected_input() {
+    local path="$1" mode="$2" parent
+    [[ -f "$path" && ! -L "$path" && "$(stat -c '%u:%g:%h:%a' "$path")" == "0:0:1:$mode" ]] || { echo "error: native input identity/permissions" >&2; return 1; }
+    parent="$(dirname "$path")"
+    while :; do
+        [[ -d "$parent" && ! -L "$parent" && "$(stat -c '%u:%g' "$parent")" == '0:0' ]] || return 1
+        local bits="$(stat -c '%a' "$parent")"
+        (( (8#$bits & 022) == 0 )) || return 1
+        [[ "$parent" == / ]] && break
+        parent="$(dirname "$parent")"
+    done
+}
+install_native_root() {
+    native_root_inputs
+    [[ $EUID -eq 0 && "$(uname -s)" == Linux && "$(uname -m)" == x86_64 && -d /run/systemd/system ]] || { echo "error: native-root installation requires Linux x86_64 root and systemd" >&2; return 1; }
+    local source="${AENV_NATIVE_SERVER_SOURCE:-}" expected="${AENV_NATIVE_SERVER_SHA256:-}"
+    [[ "$source" =~ ^/[a-zA-Z0-9_./-]+$ && "$source" != *'/../'* && "$source" != *'/./'* && "$source" != */.. && "$source" != */. && "$source" != */ && "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo "error: explicit pinned native-capable server source required" >&2; return 1; }
+    native_root_protected_input "$source" 755
+    native_root_protected_input "$NATIVE_PROFILE" 600
+    [[ "$(sha256sum "$source" | cut -d' ' -f1)" == "$expected" ]] || { echo "error: native server SHA mismatch" >&2; return 1; }
+    # No shared service stop, dependency setup, host sysctl or profile consumption.
+    local service=/etc/systemd/system/aenv-native-root.service envfile=/etc/default/aenv-native-root binarydir=/usr/local/libexec/aenv-native-root runtime=/run/aenv-native-root
+    for path in "$NATIVE_HOME" "$service" "$envfile" "$binarydir" "$runtime"; do
+        [[ ! -e "$path" && ! -L "$path" ]] || { echo "error: native-root destinations must be fresh; no overwrite/adoption" >&2; return 1; }
+    done
+    # Parent protection is checked before creating this exclusive deployment.
+    for path in "$(dirname "$NATIVE_HOME")" /etc/systemd/system /etc/default /usr/local/libexec /run; do
+        [[ -d "$path" && ! -L "$path" && "$(stat -c '%u:%g' "$path")" == '0:0' ]] || return 1
+        local bits="$(stat -c '%a' "$path")"; (( (8#$bits & 022)==0 )) || return 1
+    done
+    mkdir -m 0700 "$NATIVE_HOME" "$binarydir" "$runtime"
+    mkdir -m 0700 "$NATIVE_HOME/config" "$NATIVE_HOME/work" "$NATIVE_HOME/logs" "$NATIVE_HOME/state" "$NATIVE_HOME/snapshot-store" "$NATIVE_HOME/snapshot-local-cache"
+    install -o root -g root -m 0755 "$source" "$binarydir/server"
+    native_root_protected_input "$binarydir/server" 755
+    [[ "$(sha256sum "$binarydir/server" | cut -d' ' -f1)" == "$expected" ]] || { echo "error: installed native server SHA mismatch" >&2; return 1; }
+    (umask 077; set -o noclobber; render_native_root_config > "$NATIVE_HOME/config/config.toml")
+    # Read-only native closure validation; failure retains owned installation for inspection.
+    env -i PATH=/usr/bin:/bin AENV_CONFIG_PATH="$NATIVE_HOME/config/config.toml" "$binarydir/server" --check-native-deployment
+    (umask 077; set -o noclobber; printf 'API_ADDR="127.0.0.1:8000"\nAENV_CONFIG_PATH="%s/config/config.toml"\n' "$NATIVE_HOME" > "$envfile")
+    (umask 077; set -o noclobber; render_native_root_service > "$service")
+    systemctl daemon-reload
+    echo "Native-root installed; not started. Review fresh profile and start aenv-native-root explicitly."
+    echo "Legacy setup, snapshot/resume, template/image APIs and guest networking are unsupported."
+}
+case "${AENV_DEPLOYMENT_MODE:-legacy}" in
+    legacy) ;;
+    native-root)
+        case "${1:-}" in
+            --print-install-service) native_root_inputs; render_native_root_service; exit 0 ;;
+            --print-native-root-config) native_root_inputs; render_native_root_config; exit 0 ;;
+            '') install_native_root; exit 0 ;;
+            *) echo "error: unknown native-root installer argument" >&2; exit 1 ;;
+        esac
+        ;;
+    *) echo "error: unsupported deployment mode" >&2; exit 1 ;;
+esac
+if [[ "${1:-}" == --print-install-service ]]; then
+    printf 'User=%s\nGroup=%s\nAmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN\nSecureBits=noroot noroot-locked\nNoNewPrivileges=true\n' "${AENV_SERVICE_USER:-aenv}" "${AENV_SERVICE_GROUP:-aenv}"
+    exit 0
+fi
+
 
 if [[ $EUID -ne 0 ]] && ! sudo -v 2>/dev/null; then
     echo "error: this script requires root or sudo access" >&2
@@ -366,6 +513,7 @@ RuntimeDirectory=aenv
 RuntimeDirectoryMode=0750
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+SecureBits=noroot noroot-locked
 NoNewPrivileges=true
 UMask=0027
 LimitNOFILE=1048576

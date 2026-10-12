@@ -18,7 +18,7 @@ pub struct ImageConfigEntry {
 
 /// Collection of source image configs resolved at sandbox creation time.
 ///
-/// Serialises as a flat JSON array of [`ImageConfigEntry`] objects. An empty
+/// Serialises as a flat JSON array of `ImageConfigEntry` objects. An empty
 /// collection serialises as `[]` and is skipped by `skip_serializing_if` at
 /// the embedding site.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

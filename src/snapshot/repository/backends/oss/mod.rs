@@ -35,7 +35,7 @@ impl OssBackend {
     ///
     /// This convenience constructor remains available for tests and direct
     /// callers. The main backend factory constructs a shared cache once and
-    /// uses [`OssBackend::from_parts`] instead. Publish compression stays
+    /// uses `OssBackend::from_parts` instead. Publish compression stays
     /// disabled here; use [`OssBackend::new_with_publish_compression`] to
     /// exercise `[snapshot.publish_compression]`.
     pub fn new(config: &OssBackendConfig, cache_root: PathBuf) -> Result<Self> {

@@ -48,6 +48,10 @@ struct ServerCli {
     #[arg(long, default_value = "aenv", requires = "setup_host")]
     runtime_group: String,
 
+    /// Read-only validate explicit native-root deployment configuration.
+    #[arg(long)]
+    check_native_deployment: bool,
+
     /// Path to config file (same as AENV_CONFIG_PATH).
     #[arg(long)]
     config: Option<std::path::PathBuf>,
@@ -66,6 +70,14 @@ async fn main() -> anyhow::Result<()> {
     };
     let config = config_manager.config();
 
+    if cli.check_native_deployment {
+        anyhow::ensure!(config.is_native_root(), "native-root mode required");
+        agentenv::native_deployment::validate_policy(config)?;
+        return Ok(());
+    }
+    if config.is_native_root() && (cli.setup_only || cli.setup_host) {
+        anyhow::bail!("native-root provisioning is separate from legacy setup");
+    }
     if cli.setup_only {
         agentenv::setup::ensure_provisioning(config).await?;
         info!(target: "agentenv", "dependency setup complete (setup-only mode)");
@@ -93,15 +105,18 @@ async fn main() -> anyhow::Result<()> {
 
     agentenv::setup::ensure_environment(config, overlaybd_p2p.read_facade_address()).await?;
 
-    // Initialize the global ublk device manager (spawns daemon if configured).
-    UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
-        config,
-        overlaybd_p2p.publish_address(),
-    )
-    .await?;
+    // Native root has no legacy block/VM pools or daemon authority.
+    if !config.is_native_root() {
+        // Initialize the global ublk device manager (spawns daemon if configured).
+        UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
+            config,
+            overlaybd_p2p.publish_address(),
+        )
+        .await?;
 
-    if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
-        warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
+        if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
+            warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
+        }
     }
 
     let snapshot_p2p_transport = config
@@ -215,8 +230,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             info!(target: "agentenv", "shutting down ublk daemon");
-            if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");
+            if !config.is_native_root() {
+                if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {
+                    warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");
+                }
             }
             info!(target: "agentenv", "shutting down overlaybd p2p runtime");
             if let Err(err) = overlaybd_p2p.shutdown().await {

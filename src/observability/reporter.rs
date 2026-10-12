@@ -50,7 +50,7 @@ pub struct ObservabilityReporter {
     heartbeat_join: Option<JoinHandle<()>>,
     event_join: Option<JoinHandle<()>>,
     /// Set to `true` on the first successful heartbeat RPC. Checked in
-    /// [`shutdown`] to skip `UnregisterNode` when the reporter never managed
+    /// [`Self::shutdown`] to skip `UnregisterNode` when the reporter never managed
     /// to reach the scheduler at all.
     ever_heartbeat_succeeded: Arc<AtomicBool>,
 }
@@ -83,7 +83,7 @@ impl ObservabilityReporter {
     ///
     /// [`ObservabilityReporter::new`] only builds the reporter without starting
     /// any background work.  Call `start` **exactly once** before calling
-    /// [`shutdown`].
+    /// [`Self::shutdown`].
     pub fn start(&mut self) {
         if self.shutdown_tx.is_some() {
             warn!("reporter already started, ignoring duplicate start call");

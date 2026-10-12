@@ -24,12 +24,17 @@ thread_local! {
     pub static URING128: OnceCell<AsyncIoRing<io_uring::squeue::Entry128>> = const {OnceCell::new()};
 }
 
-#[async_trait(?Send)]
 pub trait TlsRing: Sized {
     /// Return the thread-local uring that will only be initialized for AsyncIoRing
     /// provided by [IoRingWorker].
     fn tls_ring() -> &'static std::thread::LocalKey<OnceCell<Self>>;
-    async fn unregister_fd(&self, idx: u32) -> Result<()>;
+    fn unregister_fd<'life0, 'async_trait>(
+        &'life0 self,
+        idx: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 }
 
 #[async_trait(?Send)]

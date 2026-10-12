@@ -1,6 +1,8 @@
 use anyhow::Result;
-use async_trait::async_trait;
-use std::any::Any;
+use std::{any::Any, future::Future, pin::Pin};
+
+/// Send future returned by the object-safe compact writer methods.
+pub type CompactFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A buffer obtained from a [`CompactWriter`].
 ///
@@ -47,11 +49,15 @@ where
 ///
 /// For small, caller-owned metadata blobs (header, index entries, trailer)
 /// use [`write_all_at`](CompactWriter::write_all_at).
-#[async_trait]
 pub trait CompactWriter: Send + Sync {
     /// Allocate a writable buffer whose capacity is at least
     /// [`buffer_size()`](CompactWriter::buffer_size) bytes.
-    async fn alloc_buffer(&self) -> Result<Box<dyn CompactBuffer>>;
+    fn alloc_buffer<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> CompactFuture<'async_trait, Result<Box<dyn CompactBuffer>>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Preferred / fixed buffer size in bytes returned by
     /// [`alloc_buffer`](CompactWriter::alloc_buffer).
@@ -70,7 +76,15 @@ pub trait CompactWriter: Send + Sync {
     /// file. Consumes the buffer (pooled implementations return it on drop).
     /// The `len` param helps if only want to write partial content in `buf`.
     /// If `len` > `buf` size, will return error.
-    async fn write(&self, buf: Box<dyn CompactBuffer>, offset: u64, len: usize) -> Result<()>;
+    fn write<'life0, 'async_trait>(
+        &'life0 self,
+        buf: Box<dyn CompactBuffer>,
+        offset: u64,
+        len: usize,
+    ) -> CompactFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Write a caller-owned byte slice at `offset`. Intended for small
     /// metadata writes (header, index entries, trailer).
@@ -78,23 +92,38 @@ pub trait CompactWriter: Send + Sync {
     /// The default implementation chunks the data into buffers obtained from
     /// [`alloc_buffer`](CompactWriter::alloc_buffer) and writes them
     /// sequentially.
-    async fn write_all_at(&self, data: &[u8], offset: u64) -> Result<()> {
-        let buf_size = self.buffer_size();
-        let mut off = offset;
-        for chunk in data.chunks(buf_size) {
-            let mut buf = self.alloc_buffer().await?;
-            buf.as_mut().as_mut()[..chunk.len()].copy_from_slice(chunk);
-            self.write(buf, off, chunk.len()).await?;
-            off += chunk.len() as u64;
-        }
-        Ok(())
+    fn write_all_at<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        data: &'life1 [u8],
+        offset: u64,
+    ) -> CompactFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let buf_size = self.buffer_size();
+            let mut off = offset;
+            for chunk in data.chunks(buf_size) {
+                let mut buf = self.alloc_buffer().await?;
+                buf.as_mut().as_mut()[..chunk.len()].copy_from_slice(chunk);
+                self.write(buf, off, chunk.len()).await?;
+                off += chunk.len() as u64;
+            }
+            Ok(())
+        })
     }
 
     /// Complete format-level output after all writes have finished.
     ///
     /// This does not imply flushing or syncing data to durable storage. The
     /// default implementation is a no-op.
-    async fn finalize(&self) -> Result<()> {
-        Ok(())
+    fn finalize<'life0, 'async_trait>(&'life0 self) -> CompactFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { Ok(()) })
     }
 }

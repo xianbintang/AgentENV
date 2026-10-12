@@ -454,7 +454,7 @@ mod tests {
         });
         let client = BuildkitHistory::connect(address).await?;
         let root = tempfile::tempdir()?;
-        let repository = crate::snapshot::repository::backends::PosixFsBackend::new(
+        let repository = crate::snapshot::repository::backends::PosixFsBackend::new_owned_fixture(
             crate::snapshot::repository::backends::PosixFsBackendConfig {
                 root: root.path().join("repository"),
                 cache_root: Some(root.path().join("cache")),

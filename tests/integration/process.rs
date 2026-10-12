@@ -205,7 +205,10 @@ async fn process_handle_supports_stdin_and_signal() -> Result<()> {
             )
             .await?;
 
-        assert!(handle.pid() > 0, "pid should be non-zero");
+        assert!(
+            handle.pid().is_some_and(|pid| pid > 0),
+            "pid should be non-zero"
+        );
 
         // Send one line of stdin; the shell exits after echoing it back.
         handle.send_stdin(b"interactive_test\n").await?;
@@ -221,7 +224,7 @@ async fn process_handle_supports_stdin_and_signal() -> Result<()> {
         let mut handle = sandbox
             .start_process("sleep", &["300"], &ProcessOpts::default())
             .await?;
-        assert!(handle.pid() > 0);
+        assert!(handle.pid().is_some_and(|pid| pid > 0));
 
         handle.send_signal(Signal::Sigterm).await?;
         let output = handle.wait().await?;

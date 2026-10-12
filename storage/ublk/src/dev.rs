@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::{future::Future, pin::Pin};
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 
@@ -412,11 +413,22 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
     }
 }
 
+/// Local future for ublk targets that borrow thread-local io_uring state.
+pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+
 #[async_trait(?Send)]
 pub trait UVMUblkTarget: Send + Sync + 'static {
     const DEV_NAME: &str;
     /// Init the target. For example, the target might register fd on to the io_ring.
-    async fn init(&self, qid: u16, io_ring: &AsyncIoRing) -> Result<()>;
+    fn init<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        qid: u16,
+        io_ring: &'life1 AsyncIoRing,
+    ) -> LocalBoxFuture<'async_trait, Result<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// The target can ask for an extra IO buffer, for each slot.
     /// Typically, the returned size should be multiple of 512.
@@ -429,13 +441,19 @@ pub trait UVMUblkTarget: Send + Sync + 'static {
     /// Since multiple queue and slot within each queue, will call this method concurrently,
     /// we can only get `&self` here.
     /// `extra` is an extra buffer allocated according to [UVMUblkTarget::per_slot_extra_buf_len].
-    async fn handle_io_request(
-        self: &Arc<Self>,
+    fn handle_io_request<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        self: &'life0 Arc<Self>,
         qid: u16,
         tag: u16,
         io_desc: ublk_sys::ublksrv_io_desc,
-        buf: &mut IOBuffer,
-        extra: Option<&mut IOBuffer>,
-        io_ring: &AsyncIoRing,
-    ) -> i32;
+        buf: &'life1 mut IOBuffer,
+        extra: Option<&'life2 mut IOBuffer>,
+        io_ring: &'life3 AsyncIoRing,
+    ) -> LocalBoxFuture<'async_trait, i32>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait;
 }

@@ -300,14 +300,14 @@ impl FirecrackerPool {
             .allocate_any()
             .context("firecracker pool: allocate network slot")?;
 
-        let work_dir = match create_firecracker_work_dir(self.firecracker_work_base_dir.as_deref())
-        {
-            Ok(work_dir) => work_dir,
-            Err(err) => {
-                let _ = NetworkManager::global().release(slot);
-                return Err(err).context("firecracker pool: create work dir");
-            }
-        };
+        let work_dir =
+            match create_firecracker_work_dir(self.firecracker_work_base_dir.as_deref(), false) {
+                Ok(work_dir) => work_dir,
+                Err(err) => {
+                    let _ = NetworkManager::global().release(slot);
+                    return Err(err).context("firecracker pool: create work dir");
+                }
+            };
 
         let mut fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());
         let (stdout_path, stderr_path) = warm_stdio_paths(work_dir.path(), self.capture_output);
