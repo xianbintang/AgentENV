@@ -240,43 +240,98 @@ pub trait Templates<E: std::fmt::Debug + Send + Sync + 'static = ()>:
     /// Cancel a template build and release its worker.
     ///
     /// TemplatesTemplateIdBuildsBuildIdBuilderDelete - DELETE /templates/{templateID}/builds/{buildID}/builder
-    async fn templates_template_id_builds_build_id_builder_delete(
-        &self,
+    fn templates_template_id_builds_build_id_builder_delete<
+        'life0,
+        'life1,
+        'life2,
+        'life3,
+        'life4,
+        'life5,
+        'async_trait,
+    >(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::TemplatesTemplateIdBuildsBuildIdBuilderDeletePathParams,
-    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::TemplatesTemplateIdBuildsBuildIdBuilderDeletePathParams,
+    ) -> super::ApiFuture<
+        'async_trait,
+        Result<TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse, E>,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 
     /// Prepare the BuildKit worker for a template build.
     ///
     /// TemplatesTemplateIdBuildsBuildIdBuilderPut - PUT /templates/{templateID}/builds/{buildID}/builder
-    async fn templates_template_id_builds_build_id_builder_put(
-        &self,
+    fn templates_template_id_builds_build_id_builder_put<
+        'life0,
+        'life1,
+        'life2,
+        'life3,
+        'life4,
+        'life5,
+        'life6,
+        'async_trait,
+    >(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams,
-        body: &models::TemplateBuilderRequest,
-    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPutResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams,
+        body: &'life6 models::TemplateBuilderRequest,
+    ) -> super::ApiFuture<'async_trait, Result<TemplatesTemplateIdBuildsBuildIdBuilderPutResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        'life6: 'async_trait,
+        Self: 'async_trait;
 
     /// Template build logs.
     ///
     /// TemplatesTemplateIdBuildsBuildIdLogsGet - GET /templates/{templateID}/builds/{buildID}/logs
-    async fn templates_template_id_builds_build_id_logs_get(
-        &self,
+    fn templates_template_id_builds_build_id_logs_get<
+        'life0,
+        'life1,
+        'life2,
+        'life3,
+        'life4,
+        'life5,
+        'life6,
+        'async_trait,
+    >(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::TemplatesTemplateIdBuildsBuildIdLogsGetPathParams,
-        query_params: &models::TemplatesTemplateIdBuildsBuildIdLogsGetQueryParams,
-    ) -> Result<TemplatesTemplateIdBuildsBuildIdLogsGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::TemplatesTemplateIdBuildsBuildIdLogsGetPathParams,
+        query_params: &'life6 models::TemplatesTemplateIdBuildsBuildIdLogsGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<TemplatesTemplateIdBuildsBuildIdLogsGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        'life6: 'async_trait,
+        Self: 'async_trait;
 
     /// Template build status.
     ///

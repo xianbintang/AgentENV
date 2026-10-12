@@ -410,15 +410,23 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
     /// List sandbox metrics.
     ///
     /// SandboxesMetricsGet - GET /sandboxes/metrics
-    async fn sandboxes_metrics_get(
-        &self,
+    fn sandboxes_metrics_get<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        query_params: &models::SandboxesMetricsGetQueryParams,
-    ) -> Result<SandboxesMetricsGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        query_params: &'life5 models::SandboxesMetricsGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<SandboxesMetricsGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 
     /// Create sandbox.
     ///
@@ -610,16 +618,34 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
     /// Sandbox metrics.
     ///
     /// SandboxesSandboxIdMetricsGet - GET /sandboxes/{sandboxID}/metrics
-    async fn sandboxes_sandbox_id_metrics_get(
-        &self,
+    fn sandboxes_sandbox_id_metrics_get<
+        'life0,
+        'life1,
+        'life2,
+        'life3,
+        'life4,
+        'life5,
+        'life6,
+        'async_trait,
+    >(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::SandboxesSandboxIdMetricsGetPathParams,
-        query_params: &models::SandboxesSandboxIdMetricsGetQueryParams,
-    ) -> Result<SandboxesSandboxIdMetricsGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::SandboxesSandboxIdMetricsGetPathParams,
+        query_params: &'life6 models::SandboxesSandboxIdMetricsGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<SandboxesSandboxIdMetricsGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        'life6: 'async_trait,
+        Self: 'async_trait;
 
     /// Update sandbox network.
     ///
@@ -813,54 +839,106 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
     /// List sandboxes (v2).
     ///
     /// V2SandboxesGet - GET /v2/sandboxes
-    async fn v2_sandboxes_get(
-        &self,
+    fn v2_sandboxes_get<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        query_params: &models::V2SandboxesGetQueryParams,
-    ) -> Result<V2SandboxesGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        query_params: &'life5 models::V2SandboxesGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<V2SandboxesGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 
     /// Create sandbox (v2).
     ///
     /// V2SandboxesPost - POST /v2/sandboxes
-    async fn v2_sandboxes_post(
-        &self,
+    fn v2_sandboxes_post<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        body: &models::NewSandboxV2,
-    ) -> Result<V2SandboxesPostResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        body: &'life5 models::NewSandboxV2,
+    ) -> super::ApiFuture<'async_trait, Result<V2SandboxesPostResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        Self: 'async_trait;
 
     /// Connect sandbox (v2).
     ///
     /// V2SandboxesSandboxIdConnectPost - POST /v2/sandboxes/{sandboxID}/connect
-    async fn v2_sandboxes_sandbox_id_connect_post(
-        &self,
+    fn v2_sandboxes_sandbox_id_connect_post<
+        'life0,
+        'life1,
+        'life2,
+        'life3,
+        'life4,
+        'life5,
+        'life6,
+        'async_trait,
+    >(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::V2SandboxesSandboxIdConnectPostPathParams,
-        body: &Option<models::ConnectSandboxV2>,
-    ) -> Result<V2SandboxesSandboxIdConnectPostResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::V2SandboxesSandboxIdConnectPostPathParams,
+        body: &'life6 Option<models::ConnectSandboxV2>,
+    ) -> super::ApiFuture<'async_trait, Result<V2SandboxesSandboxIdConnectPostResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        'life6: 'async_trait,
+        Self: 'async_trait;
 
     /// Sandbox logs (v2).
     ///
     /// V2SandboxesSandboxIdLogsGet - GET /v2/sandboxes/{sandboxID}/logs
-    async fn v2_sandboxes_sandbox_id_logs_get(
-        &self,
+    fn v2_sandboxes_sandbox_id_logs_get<
+        'life0,
+        'life1,
+        'life2,
+        'life3,
+        'life4,
+        'life5,
+        'life6,
+        'async_trait,
+    >(
+        &'life0 self,
 
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        path_params: &models::V2SandboxesSandboxIdLogsGetPathParams,
-        query_params: &models::V2SandboxesSandboxIdLogsGetQueryParams,
-    ) -> Result<V2SandboxesSandboxIdLogsGetResponse, E>;
+        method: &'life1 Method,
+        host: &'life2 Host,
+        cookies: &'life3 CookieJar,
+        claims: &'life4 Self::Claims,
+        path_params: &'life5 models::V2SandboxesSandboxIdLogsGetPathParams,
+        query_params: &'life6 models::V2SandboxesSandboxIdLogsGetQueryParams,
+    ) -> super::ApiFuture<'async_trait, Result<V2SandboxesSandboxIdLogsGetResponse, E>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        'life5: 'async_trait,
+        'life6: 'async_trait,
+        Self: 'async_trait;
 }
